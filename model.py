@@ -62,7 +62,7 @@ class lumos(nn.Module):
         self.light_hat = light_hat
         
         self.shading_all_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_d_hat, self.light_hat)) * self.mask
-        self.sepc_all_hat = 0.8 * l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light_hat)) * self.mask
+        self.sepc_all_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light_hat)) * self.mask
         self.rendering_all_hat = self.albedo_hat * self.shading_all_hat
         self.rendering_all_hat3 = self.rendering_all_hat + self.albedo_hat * self.sepc_all_hat
 
@@ -76,7 +76,7 @@ class lumos(nn.Module):
         shading_transport_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_d_hat, self.light)) * self.mask
         L_shading_transport = self.loss_l1(shading_transport_hat, self.shading)
 
-        spec_transport_hat = 0.8 * l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light)) * self.mask
+        spec_transport_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light)) * self.mask
         # L_spec_transport = self.loss_l1((spec_transport_hat * self.albedo).clamp_(0, 1), self.prt_s)
         # L_spec_transport1 = self.loss_l1((spec_transport_hat * self.albedo_hat).clamp_(0, 1), self.prt_s)
         L_spec_transport = self.loss_l1(spec_transport_hat * self.albedo, self.prt_s)
@@ -85,7 +85,7 @@ class lumos(nn.Module):
         shading_light_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_d, self.light_hat)) * self.mask
         L_shading_light = self.loss_l1(shading_light_hat, self.shading)
 
-        spec_light_hat = 0.8 * l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s, self.light_hat)) * self.mask
+        spec_light_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s, self.light_hat)) * self.mask
         # L_spec_light = self.loss_l1((spec_light_hat * self.albedo).clamp_(0, 1), self.prt_s)
         # L_spec_light1 = self.loss_l1((spec_light_hat * self.albedo_hat).clamp_(0, 1), self.prt_s)
         L_spec_light = self.loss_l1(spec_light_hat * self.albedo, self.prt_s)
