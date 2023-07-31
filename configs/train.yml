@@ -1,0 +1,8 @@
+yaml_dir: ./data_info/data.yaml
+light_dir: /input/pihuaijin/datasets/sl_relight/sh_hdr
+
+epoch: 300
+data_load_works: 4
+save_fre: 1
+lr: 0.0001
+
