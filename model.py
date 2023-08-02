@@ -4,7 +4,7 @@ import torch
 import os
 import numpy as np
 from PIL import Image
-from networks import CNNAE2ResNet
+import networks
 from utils import ssim, psnr
 import sfloss as sfl
 import torch.nn.functional as F
@@ -27,15 +27,20 @@ class lumos(nn.Module):
         self.optimizers = []
         self.device = torch.device("cuda", opt.local_rank)
         self.name = None
+        self.epoch = 1
 
         self.loss_l1 = nn.L1Loss().to(self.device)
         self.sf_loss = sfl.SpatialFrequencyLoss(num_channels=3, device=self.device)
 
-        self.optimizer_name = ['optimizer_G']
-        self.net_name = ['model']
-        self.net_model = CNNAE2ResNet(albedo_decoder_channels=3).to(self.device)
+        self.optimizer_name = ['optim_main', 'optim_residual']
+        self.net_name = ['main', 'residual']
+        
+        self.net_main = networks.CNNAE2ResNet(albedo_decoder_channels=3).to(self.device)
+        self.optim_main = torch.optim.Adam(self.net_main.parameters(),lr=opt.lr, betas=(0.5, 0.999))
+        self.net_residual = networks.define_G(6, 3, 32, local_rank=opt.local_rank, init_type='normal',
+                                            init_gain=0.02, Net='Spec')
+        self.optim_residual = torch.optim.Adam(self.net_residual.parameters(),lr=opt.lr, betas=(0.5, 0.999))
 
-        self.optimizer_G = torch.optim.Adam(self.net_model.parameters(),lr=opt.lr, betas=(0.5, 0.999))
         self.loss_all = {}
         self.loss_name = self.get_loss_name()
 
@@ -45,9 +50,11 @@ class lumos(nn.Module):
         self.mask = data['mask'].to(self.device)
         self.albedo = data['albedo'].to(self.device) * self.mask
         self.shading = data['shading'].to(self.device) * self.mask
+        self.bshading = data['bshading'].to(self.device) * self.mask
         self.transport_d = data['transport_d'].to(self.device)
         self.transport_s = data['transport_s'].to(self.device)
         self.prt_d = data['prt_d'].to(self.device) * self.mask
+        self.bprt_d = data['bprt_d'].to(self.device) * self.mask
         self.prt_s = data['prt_s'].to(self.device) * self.mask
         self.light = data['light'].to(self.device)
         self.input = data['input'].to(self.device) * self.mask
@@ -55,16 +62,24 @@ class lumos(nn.Module):
             self.name = data['name']
 
     def forward(self, val=False):
-        transport_d_hat, transport_s_hat, albedo_hat, light_hat = self.net_model(self.input)
+        transport_d_hat, transport_s_hat, albedo_hat, light_hat = self.net_main(self.input)
         self.albedo_hat = self.mask * albedo_hat
         self.transport_d_hat = self.mask * transport_d_hat
         self.transport_s_hat = self.mask * transport_s_hat
         self.light_hat = light_hat
         
-        self.shading_all_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_d_hat, self.light_hat)) * self.mask
+        self.shading_all_hat_linear = torch.einsum('bchw,bcd->bdhw', self.transport_d_hat, self.light_hat)
+        self.shading_all_hat = l2srgb(self.shading_all_hat_linear) * self.mask
         self.sepc_all_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light_hat)) * self.mask
         self.rendering_all_hat = self.albedo_hat * self.shading_all_hat
         self.rendering_all_hat3 = self.rendering_all_hat + self.albedo_hat * self.sepc_all_hat
+        
+        if self.epoch > self.opt.res_epoch or self.opt.test:
+            self.shading_res = self.net_residual(torch.cat([self.shading_all_hat.detach(), 
+                                self.transport_d_hat.detach()], 1), self.light_hat.detach()) * self.mask
+            self.shading_final = l2srgb(self.shading_all_hat_linear + self.shading_res) * self.mask
+            self.rendering_d = self.shading_final * self.albedo_hat
+            self.rendering_final = self.rendering_d + self.albedo_hat * self.sepc_all_hat
 
     def backward_G(self):
         L_transport_d = self.loss_l1(self.transport_d_hat, self.transport_d)
@@ -77,8 +92,6 @@ class lumos(nn.Module):
         L_shading_transport = self.loss_l1(shading_transport_hat, self.shading)
 
         spec_transport_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light)) * self.mask
-        # L_spec_transport = self.loss_l1((spec_transport_hat * self.albedo).clamp_(0, 1), self.prt_s)
-        # L_spec_transport1 = self.loss_l1((spec_transport_hat * self.albedo_hat).clamp_(0, 1), self.prt_s)
         L_spec_transport = self.loss_l1(spec_transport_hat * self.albedo, self.prt_s)
         L_spec_transport1 = self.loss_l1(spec_transport_hat * self.albedo_hat, self.prt_s)
 
@@ -86,48 +99,34 @@ class lumos(nn.Module):
         L_shading_light = self.loss_l1(shading_light_hat, self.shading)
 
         spec_light_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s, self.light_hat)) * self.mask
-        # L_spec_light = self.loss_l1((spec_light_hat * self.albedo).clamp_(0, 1), self.prt_s)
-        # L_spec_light1 = self.loss_l1((spec_light_hat * self.albedo_hat).clamp_(0, 1), self.prt_s)
         L_spec_light = self.loss_l1(spec_light_hat * self.albedo, self.prt_s)
         L_spec_light1 = self.loss_l1(spec_light_hat * self.albedo_hat, self.prt_s)
 
         L_shading_all = self.loss_l1(self.shading_all_hat, self.shading)
-        # L_spec_all = self.loss_l1((self.sepc_all_hat * self.albedo).clamp_(0, 1), self.prt_s)
-        # L_spec_all1 = self.loss_l1((self.sepc_all_hat * self.albedo_hat).clamp_(0, 1), self.prt_s)
         L_spec_all = self.loss_l1(self.sepc_all_hat * self.albedo, self.prt_s)
         L_spec_all1 = self.loss_l1(self.sepc_all_hat * self.albedo_hat, self.prt_s)
         L_shading_all_sf = self.sf_loss(self.shading_all_hat, self.shading)
 
         rendering_albedo_hat = (self.albedo_hat * self.shading)
-        # L_rendering_albedo = self.loss_l1(rendering_albedo_hat.clamp_(0, 1), self.prt_d)
         L_rendering_albedo = self.loss_l1(rendering_albedo_hat, self.prt_d)
                 
-        # rendering_transport_hat = (self.albedo * shading_transport_hat).clamp_(0, 1)
         rendering_transport_hat = self.albedo * shading_transport_hat
         L_rendering_transport = self.loss_l1(rendering_transport_hat, self.prt_d)
                 
-        # rendering_light_hat = (self.albedo * shading_light_hat).clamp_(0, 1)
         rendering_light_hat = self.albedo * shading_light_hat
         L_rendering_light = self.loss_l1(rendering_light_hat, self.prt_d)
                 
-        # rendering_albedo_transport_hat = (self.albedo_hat * shading_transport_hat).clamp_(0, 1)
         rendering_albedo_transport_hat = self.albedo_hat * shading_transport_hat
         L_rendering_albedo_transport = self.loss_l1(rendering_albedo_transport_hat, self.prt_d)
                 
-        # rendering_transport_light_hat = (self.albedo * self.shading_all_hat).clamp_(0, 1)
         rendering_transport_light_hat = self.albedo * self.shading_all_hat
         L_rendering_transport_light = self.loss_l1(rendering_transport_light_hat, self.prt_d)
 
-        # rendering_albedo_light_hat = (self.albedo_hat * shading_light_hat).clamp_(0, 1)
         rendering_albedo_light_hat = self.albedo_hat * shading_light_hat
         L_rendering_albedo_light = self.loss_l1(rendering_albedo_light_hat, self.prt_d)
                 
         rendering_all_hat1 = self.rendering_all_hat + self.albedo_hat * spec_transport_hat
         rendering_all_hat2 = self.rendering_all_hat + self.albedo_hat * spec_light_hat
-        # L_rendering_all = self.loss_l1(self.rendering_all_hat.clamp_(0, 1), self.prt_d)
-        # L_rendering_all1 = self.loss_l1(rendering_all_hat1.clamp_(0, 1), self.input * 0.5 + 0.5)
-        # L_rendering_all2 = self.loss_l1(rendering_all_hat2.clamp_(0, 1), self.input * 0.5 + 0.5)
-        # L_rendering_all3 = self.loss_l1(self.rendering_all_hat3.clamp_(0, 1), self.input * 0.5 + 0.5)
         L_rendering_all = self.loss_l1(self.rendering_all_hat, self.prt_d)
         L_rendering_all1 = self.loss_l1(rendering_all_hat1, self.input * 0.5 + 0.5)
         L_rendering_all2 = self.loss_l1(rendering_all_hat2, self.input * 0.5 + 0.5)
@@ -144,14 +143,27 @@ class lumos(nn.Module):
             self.opt.w_shading_light * (L_spec_light + L_spec_light1) * 0.5 +\
             self.opt.w_shading_all * (L_spec_all + L_spec_all1) * 0.5 +\
             self.opt.w_rendering_all * (L_rendering_all1 + L_rendering_all2 + L_rendering_all3) * 0.5
+            
+        if self.epoch > self.opt.res_epoch:
+            L_shading_final = self.loss_l1(self.shading_final, self.bshading)
+            L_shading_sf = self.sf_loss(self.shading_final, self.bshading)
+            L_rendering_diff = self.loss_l1(self.rendering_d, self.bprt_d)
+            
+            self.loss_res = L_shading_final + L_shading_sf + L_rendering_diff
+            self.loss_total += self.loss_res
         self.loss_total.backward()
 
-    def optimize_parameters(self):
+    def optimize_parameters(self, epoch):
+        self.epoch = epoch
+        
         self.forward()
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
-        self.optimizer_G.zero_grad()  # set G_A and G_B's gradients to zero
+        self.optim_main.zero_grad()  # set G_A and G_B's gradients to zero
+        self.optim_residual.zero_grad()
         self.backward_G()             # calculate gradients for G_A and G_B
-        self.optimizer_G.step()       # update G_A and G_B's weights
+        self.optim_main.step()       # update G_A and G_B's weights
+        if self.epoch > self.opt.res_epoch:
+            self.optim_residual.step()
 
     def update_lr(self, epoch):
         decay_epoch = self.opt.epochs // 2
@@ -218,29 +230,7 @@ class lumos(nn.Module):
         # shape of output_vs_gt_plot [B, C, H, W]
         psnr_group = []
         for id in range(self.albedo_hat.shape[0]):
-            if test is None:
-                output_vs_gt_plot = torch.cat([
-                                    self.albedo_hat[id:id+1].detach(), 
-                                    self.albedo[id:id+1].detach(), 
-                                    self.shading_all_hat[id:id+1].detach(),
-                                    self.shading[id:id+1].detach(),
-                                    self.sepc_all_hat[id:id+1].detach(),
-                                    self.prt_s[id:id+1].detach(),
-                                    self.rendering_all_hat[id:id+1].detach(),
-                                    self.prt_d[id:id+1].detach(),
-                                    self.rendering_all_hat3[id:id+1].detach(),
-                                    ((self.input[id:id+1] * 0.5 + 0.5) * self.mask).detach(),
-                                    ], 0)
-            else:    
-                output_vs_gt_plot = torch.cat([
-                                    self.albedo_hat[id:id+1].detach(), 
-                                    self.shading_all_hat[id:id+1].detach(),
-                                    self.sepc_all_hat[id:id+1].detach(),
-                                    self.rendering_all_hat[id:id+1].detach(),
-                                    self.rendering_all_hat3[id:id+1].detach(),
-                                    ((self.input[id:id+1] * 0.5 + 0.5) * self.mask).detach(),
-                                    ], 0)
-                
+            output_vs_gt_plot = self.concat_img(id, test)
             out = torchvision.utils.make_grid(output_vs_gt_plot,
                                             scale_each=False,
                                             normalize=False,
@@ -264,9 +254,56 @@ class lumos(nn.Module):
             psnr_group.append(psnr(((self.input[id] * 0.5 + 0.5) * self.mask[id]).detach(), self.rendering_all_hat3[id].detach()))
         ssim_batch = [ssim(((self.input * 0.5 + 0.5) * self.mask).detach(), self.rendering_all_hat3.detach())]
         return ssim_batch, psnr_group
+    
+    def concat_img(self, id, test=None):
+        if test is None:
+            if self.epoch > self.opt.res_epoch:
+                output_vs_gt_plot = torch.cat([
+                                    self.albedo_hat[id:id+1].detach(), 
+                                    self.albedo[id:id+1].detach(), 
+                                    self.shading_all_hat[id:id+1].detach(),
+                                    self.shading[id:id+1].detach(),
+                                    self.shading_final.detach(),
+                                    self.bshading[id: id+1].detach(),
+                                    self.sepc_all_hat[id:id+1].detach(),
+                                    self.prt_s[id:id+1].detach(),
+                                    self.rendering_all_hat[id:id+1].detach(),
+                                    self.prt_d[id:id+1].detach(),
+                                    self.rendering_d.detach(),
+                                    self.bprt_d[id:id+1].detach(),
+                                    self.rendering_all_hat3[id:id+1].detach(),
+                                    self.rendering_final[id:id+1].detach(),
+                                    ((self.input[id:id+1] * 0.5 + 0.5) * self.mask).detach(),
+                                    ], 0)
+            else:
+                output_vs_gt_plot = torch.cat([
+                                    self.albedo_hat[id:id+1].detach(), 
+                                    self.albedo[id:id+1].detach(), 
+                                    self.shading_all_hat[id:id+1].detach(),
+                                    self.shading[id:id+1].detach(),
+                                    self.sepc_all_hat[id:id+1].detach(),
+                                    self.prt_s[id:id+1].detach(),
+                                    self.rendering_all_hat[id:id+1].detach(),
+                                    self.prt_d[id:id+1].detach(),
+                                    self.rendering_all_hat3[id:id+1].detach(),
+                                    ((self.input[id:id+1] * 0.5 + 0.5) * self.mask).detach(),
+                                    ], 0)
+        else:    
+            output_vs_gt_plot = torch.cat([
+                                self.albedo_hat[id:id+1].detach(), 
+                                self.shading_all_hat[id:id+1].detach(),
+                                self.shading_final[id:id+1].detach(),
+                                self.sepc_all_hat[id:id+1].detach(),
+                                self.rendering_all_hat[id:id+1].detach(),
+                                self.rendering_d.detach(),
+                                self.rendering_all_hat3[id:id+1].detach(),
+                                self.rendering_final.detach(),
+                                ((self.input[id:id+1] * 0.5 + 0.5) * self.mask).detach(),
+                                ], 0)
+        return output_vs_gt_plot
 
     def get_loss_name(self):
-        name = ['total']
+        name = ['total', 'res']
         return name
     
     def initialize_loss(self):
@@ -280,5 +317,7 @@ class lumos(nn.Module):
             return loss_all
 
         for idx, name in enumerate(self.loss_name):
+            if self.epoch <= self.opt.res_epoch and name == 'res':
+                continue
             value = getattr(self, 'loss_' + name).item()
             self.loss_all[name] += value

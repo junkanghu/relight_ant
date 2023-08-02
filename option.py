@@ -37,6 +37,8 @@ def get_opt():
                         help='Learning rate for training')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='batch size for training')
+    parser.add_argument('--res_epoch', type=int, default=30,
+                        help='when to start training the residual net')
 
     parser.add_argument('--yaml_dir', default='/nas/home/hujunkang/data.yaml', help='Directory for test input images')
     parser.add_argument('--light_dir', '-l0', default="/nas/home/hujunkang/sh_hdr", help='Light directory for training')

@@ -11,6 +11,7 @@ import logging
 import os
 
 if __name__ == "__main__":
+    torch.backends.cudnn.benchmark = True
     opt = get_opt()
     init_distributed_mode(opt)
     logging.basicConfig(filename=opt.log_dir, filemode='a', format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.INFO)
@@ -34,7 +35,7 @@ if __name__ == "__main__":
             dataloader_train.sampler.set_epoch(epoch) # Used for data shuffling. If not set, no shuffling.
         for i, data in tqdm(enumerate(dataloader_train), ascii=True, desc='training iterations'):
             get_model(model).set_input(data)
-            get_model(model).optimize_parameters()
+            get_model(model).optimize_parameters(epoch)
             if (opt.distributed and dist.get_rank() == 0) or not opt.distributed:
                 get_model(model).gather_loss()
 

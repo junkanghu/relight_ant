@@ -22,8 +22,10 @@ class Dataset(torch.utils.data.Dataset):
             self.light_yaml_info = yaml_info
 
             self.prt_d_dir = []
+            self.bprt_d_dir = []
             self.prt_s_dir = []
             self.shading_dir = []
+            self.bshading_dir = []
             self.albedo_dir = []
             self.mask_dir = []
             self.transport_d_dir = []
@@ -39,8 +41,10 @@ class Dataset(torch.utils.data.Dataset):
                 pose_name = img_name.split('_')[0]
                 
                 self.prt_d_dir.append(os.path.join(change_dir('prt_d'), img_name))
+                self.bprt_d_dir.append(os.path.join(change_dir('bprt_d'), img_name))
                 self.prt_s_dir.append(os.path.join(change_dir('prt_s'), img_name))
                 self.shading_dir.append(os.path.join(change_dir('shading'), img_name))
+                self.bshading_dir.append(os.path.join(change_dir('bshading'), img_name))
                 self.albedo_dir.append(os.path.join(change_dir('albedo'), pose_name + '.png'))
                 self.mask_dir.append(os.path.join(change_dir('mask'), pose_name + '.png'))
                 self.transport_d_dir.append(os.path.join(change_dir('transport_d'), pose_name + '.npy'))
@@ -65,8 +69,10 @@ class Dataset(torch.utils.data.Dataset):
             albedo = Image.open(self.albedo_dir[idx1])
             prt = Image.open(self.prt_dir[idx1])
             prt_d = Image.open(self.prt_d_dir[idx1])
+            bprt_d = Image.open(self.bprt_d_dir[idx1])
             prt_s = Image.open(self.prt_s_dir[idx1])
             shading = Image.open(self.shading_dir[idx1])
+            bshading = Image.open(self.bshading_dir[idx1]) # srgb
             transport_d = np.load(self.transport_d_dir[idx1])
             transport_s = np.load(self.transport_s_dir[idx1])
             light = self.load_light(self.light_dir[idx1])[:, ::-1] # bgr -> rgb
@@ -86,8 +92,10 @@ class Dataset(torch.utils.data.Dataset):
             return_dict = {
                 'input': input,
                 'prt_d': prt_d,
+                'bprt_d': bprt_d,
                 'prt_s': prt_s,
                 'shading': shading,
+                'bshading': bshading,
                 'albedo': albedo,
                 'mask': mask,
                 'transport_d': transport_d,

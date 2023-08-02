@@ -350,7 +350,7 @@ class UnetGenerator(nn.Module):
 class specular(nn.Module):
     """Create a Unet-based generator"""
 
-    def __init__(self, input_nc, output_nc, ngf=8):
+    def __init__(self, input_nc, output_nc, ngf=8, sh_num=25):
         """Construct a Unet generator
         Parameters:
             input_nc (int)  -- the number of channels in input images
@@ -402,6 +402,10 @@ class specular(nn.Module):
             nn.LeakyReLU(0.2, True),
             BlurPool(256, stride=2)
         ])
+        self.fusion = nn.Sequential(*[
+            nn.Conv2d(512, 256, 3, 1, 1, bias=True),
+            nn.LeakyReLU(0.2, True),
+        ])
         self.d1 = nn.Sequential(*[
             nn.Upsample(scale_factor=2, mode='bilinear'),
             nn.Conv2d(256, 256, 3, 1, 1, bias=True),
@@ -439,15 +443,19 @@ class specular(nn.Module):
         
 
         self.out1 = nn.Sequential(*[
-            nn.Conv2d(16, output_nc, 1, 1),
+            nn.Conv2d(16, 8, 3, 1, 1, bias=True),
+            nn.Conv2d(8, output_nc, 1, 1),
             # nn.Softmax()
             # nn.ReLU(True)
             # nn.Sigmoid()
         ])
 
+        self.fc_light = nn.Linear(25*3, 256)
+        self.up_light = nn.Upsample(scale_factor=8)
 
-
-    def forward(self, x):
+    def forward(self, x, light):
+        light = torch.flatten(light, 1).unsqueeze(-1).unsqueeze(-1)
+        light = self.up_light(self.fc_light(light))
         o1 = self.e1(x)
         o2 = self.e2(o1)
         o3 = self.e3(o2)
@@ -455,6 +463,7 @@ class specular(nn.Module):
         o5 = self.e5(o4)
         o6 = self.e6(o5)
         bottle = self.bottle(o6)
+        bottle = self.fusion(torch.cat([bottle, light], 1))
         d1 = self.d1(bottle)
         d2 = self.d2(torch.cat([o6, d1], 1))
         d3 = self.d3(torch.cat([o5, d2], 1))
