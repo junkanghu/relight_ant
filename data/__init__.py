@@ -8,7 +8,7 @@ def get_dir(opt):
             data_info = yaml.safe_load(f)
         scan_path = []
 
-        for idx, scan in enumerate(data_info[:2]):
+        for idx, scan in enumerate(data_info):
             scan_dir = scan[0]['albedo'].split('/albedo')[0] # xxx/../0000
             scan_path.append(scan_dir)
         # get scan dirs
