@@ -1,6 +1,6 @@
-from dataset import create_dataset
+from data.TrainDataset import create_dataset
 from option import get_opt
-from model import lumos
+from models.TrainModel import lumos
 from tqdm import tqdm
 from utils import init_distributed_mode
 from torch.utils.tensorboard import SummaryWriter
@@ -11,7 +11,7 @@ import logging
 import os
 
 if __name__ == "__main__":
-    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.benchmark = True
     opt = get_opt()
     init_distributed_mode(opt)
     logging.basicConfig(filename=opt.log_dir, filemode='a', format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.INFO)
@@ -60,10 +60,10 @@ if __name__ == "__main__":
             psnr = []
             for i, data in enumerate(dataloader_val):
                 with torch.no_grad():
-                    get_model(model).set_input(data, val=True)
+                    get_model(model).set_input(data)
                     get_model(model).eval()
-                    get_model(model).forward(val=True)
-                    ssim_batch, psnr_batch = get_model(model).plot_val(epoch)
+                    get_model(model).forward()
+                    ssim_batch, psnr_batch = get_model(model).plot(epoch)
                     get_model(model).train()
                     ssim += ssim_batch
                     psnr += psnr_batch

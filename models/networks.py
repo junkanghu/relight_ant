@@ -1,14 +1,262 @@
 import torch
 import torch.nn as nn
 import functools
+import numpy as np
 from torch.nn import init
 from torch.optim import lr_scheduler
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from antialiased_cnns.blurpool import BlurPool
 import math
+ac_type = {
+    "relu": nn.ReLU,
+    "leakyrelu": nn.LeakyReLU,
+    "sigmoid": nn.Sigmoid,
+    "tanh": nn.Tanh
+}
 
-train_baseline = True
+norm_type = {
+    "batch": nn.BatchNorm2d,
+    "instance": nn.InstanceNorm2d
+}
+
+class VideoRelight(nn.Module):
+    def __init__(self, encoder_dims=[3, 64, 128, 256, 512, 512],
+                decoder_dims=[512, 512, 256, 128, 64, 32],
+                skip_dims=[512, 256, 128, 64, 0],
+                light_dims=[512*3, 512, 256, 128], sh_num=25, use_res=False):
+        super().__init__()
+        self.use_res = use_res
+        self.encoder = Encoder(encoder_dims)
+        self.decoder = Decoder(decoder_dims, skip_dims, light_dims, sh_num)
+        if use_res:
+            self.shading_res = S_Res()
+        
+    def forward(self, x):
+        x = self.encoder(x)
+        t_d, t_s, albedo, light = self.decoder(x)
+        if not self.use_res:
+            return t_d, t_s, albedo, light
+        res = self.shading_res(t_d, light)
+        return t_d, t_s, albedo, light, res
+    
+class ConvBlock(nn.Module):
+    def __init__(self, in_nc, out_nc,
+                kernel_size, stride, padding, bias=False,
+                norm=None, ac=None, lr_slope=0.01):
+        """
+        Args:
+            in_nc (int): input channels
+            out_nc (int): output channels
+            kernel_size (int): kernel_size for conv
+            stride (int): stride for conv
+            padding (int): padding for conv
+            bias (bool, optional): bias for conv
+            norm (string, optional): choice ["batch", "instance"]
+            ac (string, optional): choice ["relu", "leakyrelu", "sigmoid", "tanh"]
+            lr_slope (float, optional): negtive slope for LeakyRelu. Defaults to 0.01.
+        """   
+        super().__init__()
+        model = [nn.Conv2d(in_nc, out_nc, kernel_size, stride, padding, bias=bias)]
+        if norm is not None:
+            model.append(norm_type[norm](out_nc))
+        if ac is not None:
+            if ac == "relu":
+                ac_layer = ac_type[ac](True)
+            elif ac == "leakyrelu":
+                ac_layer = ac_type[ac](lr_slope, True)
+            else:
+                ac_layer = ac_type[ac]()
+            model.append(ac_layer)
+        self.model = nn.Sequential(*model)
+        
+    def forward(self, x):
+        return self.model(x)
+
+class Encoder(nn.Module):
+    def __init__(self, dims:list):
+        """
+        Args:
+            dims (list): Features dimensions. The first is the input one.
+        """        
+        super().__init__()
+        self.n_layer = len(dims) - 1
+        for i in range(self.n_layer):
+            setattr(self, "e{}".format(i),
+                    ConvBlock(dims[i], dims[i+1], 4, 2, 1,
+                                norm="batch" if i > 0 else None, ac="leakyrelu"))
+        
+    def forward(self, x):
+        out = []
+        for i in range(self.n_layer):
+            block = getattr(self, "e{}".format(i))
+            x = block(x)
+            out.append(x)
+        return out
+
+class UpsamplingBlock(nn.Module):
+    def __init__(self, in_nc, skin_nc, out_nc,
+                kernel_size, stride, padding, bias=False,
+                norm=None, ac=None, dropout=False, drop_p=0.5, lr_slope=0.01):
+        """Upsampling block for decoder.
+
+        Args:
+            in_nc (int): input channels
+            out_nc (int): output channels
+            kernel_size (int): kernel_size for conv
+            stride (int): stride for conv
+            padding (int): padding for conv
+            bias (bool, optional): bias for conv
+            norm (string, optional): choice ["batch", "instance"]
+            ac (string, optional): choice ["relu", "leakyrelu", "sigmoid", "tanh"]
+            dropout (bool, optional): Whether use dropout. Defaults to False.
+            drop_p (float, optional): Drop out parameter. Defaults to 0.5.
+            lr_slope (float, optional): negtive slope for LeakyRelu. Defaults to 0.01.
+        """        
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        model = [nn.Conv2d(in_nc + skin_nc, out_nc, kernel_size, stride, padding, bias=bias)]
+        if norm is not None:
+            model.append(norm_type[norm](out_nc))
+        if dropout:
+            model.append(nn.Dropout(drop_p))
+        if ac is not None:
+            if ac == "relu":
+                ac_layer = ac_type[ac](True)
+            elif ac == "leakyrelu":
+                ac_layer = ac_type[ac](lr_slope, True)
+            else:
+                ac_layer = ac_type[ac]()
+            model.append(ac_layer)
+        self.model = nn.Sequential(*model)
+    
+    def forward(self, x1, x2=None):
+        """
+
+        Args:
+            x1: Features from the last block of the decoder.
+            x2: Features from the encoder.
+
+        Returns:
+            Features
+        """        
+        x1 = self.upsample(x1)
+        if x2 is not None:
+            x1 = torch.cat([x1, x2], 1)
+        x1 = self.model(x1)
+        return x1
+
+class Decoder_Albedo(nn.Module):
+    def __init__(self, decoder_dims, skip_dims):
+        """Branch for albedo.
+
+        Args:
+            decoder_dims (list): Dimensions of features in the decoder.
+            skip_dims (list): Dimensions of features from encoder.
+        """        
+        super().__init__()
+        self.bottlneck = ResnetBlock(decoder_dims[0], 'zero', "batch", False, True)
+        self.n_layer = len(decoder_dims) - 1
+        for i in range(self.n_layer):
+            setattr(self, "up{}".format(i),
+                UpsamplingBlock(decoder_dims[i], skip_dims[i], decoder_dims[i+1], 3, 1, 1,
+                    norm="batch", ac="relu", dropout=True if i < 2 else False))
+        self.out = nn.Sequential(nn.Conv2d(decoder_dims[-1], 3, kernel_size=3, stride=1, padding=1, bias=False),
+                                nn.Sigmoid())
+        
+    def forward(self, x):
+        bottle = self.bottlneck(x[-1])
+        for i in range(self.n_layer):
+            layer = getattr(self, "up{}".format(i))
+            inter = layer(bottle if i == 0 else inter, x[-(i + 2)] if not i == self.n_layer - 1 else None)
+        inter = self.out(inter)
+        return inter, bottle
+
+class Decoder_Transport(nn.Module):
+    def __init__(self, decoder_dims, skip_dims, sh_num):
+        """Branch for transport.
+
+        Args:
+            decoder_dims (list): Dimensions of features in the decoder.
+            skip_dims (list): Dimensions of features from encoder.
+            sh_num (int): Number of SH parameters which is determined by the SH order.
+        """        
+        super().__init__()
+        self.bottlneck = ResnetBlock(decoder_dims[0], 'zero', "batch", False, True)
+        self.n_layer = len(decoder_dims) - 1
+        for i in range(self.n_layer):
+            setattr(self, "upd{}".format(i),
+                UpsamplingBlock(decoder_dims[i], skip_dims[i], decoder_dims[i+1], 3, 1, 1,
+                    norm="batch", ac="relu", dropout=True if i < 2 else False))
+            if i > 2:
+                setattr(self, "ups{}".format(i),
+                    UpsamplingBlock(decoder_dims[i], skip_dims[i], decoder_dims[i+1], 3, 1, 1,
+                        norm="batch", ac="relu", dropout=True if i < 2 else False))
+        self.out_d = nn.Conv2d(decoder_dims[-1], sh_num, kernel_size=3, stride=1, padding=1, bias=False)
+        self.out_s = nn.Conv2d(decoder_dims[-1], sh_num, kernel_size=3, stride=1, padding=1, bias=False)
+        
+    def forward(self, x):
+        bottle = self.bottlneck(x[-1])
+        for i in range(self.n_layer):
+            if i > 2:
+                layer_s = getattr(self, "ups{}".format(i))
+                inter1 = layer_s(inter if i == 3 else inter1, x[-(i + 2)] if not i == self.n_layer - 1 else None)
+            layer_d = getattr(self, "upd{}".format(i))
+            inter = layer_d(bottle if i == 0 else inter, x[-(i + 2)] if not i == self.n_layer - 1 else None)
+        inter = self.out_d(inter)
+        inter1 = self.out_s(inter1)
+        return inter, inter1, bottle
+    
+class Decoder_Light(nn.Module):
+    def __init__(self, dims, sh_num):
+        """Branch for transport.
+
+        Args:
+            dims (list): Dimensions of features in the decoder.
+            sh_num (int): Number of SH parameters which is determined by the SH order.
+        """        
+        super().__init__()
+        self.n_layer = len(dims) - 1
+        self.sh_num = sh_num
+        model = []
+        for i in range(self.n_layer):
+            model.append(ConvBlock(dims[i], dims[i+1], 4, 2, 1, norm="batch", ac="leakyrelu"))
+        model.append(nn.Conv2d(dims[-1], sh_num * 3, 4, stride=2, padding=1)) # 2 -> 1
+        self.model = nn.Sequential(*model)
+        
+    def forward(self, e, bt, ba):
+        """
+        Args:
+            e: The features of the last layer of the encoder.
+            ba: BottleNeck features of albedo Decoder.
+            bt: BottleNeck features of transport Decoder.
+        """
+        x = torch.cat([e, bt, ba], 1)
+        x = self.model(x)
+        x = x.reshape(-1, self.sh_num, 3)
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, decoder_dims=[512, 512, 256, 128, 64, 32],
+                skip_dims=[512, 256, 128, 64, 0],
+                light_dims=[512*3, 512, 256, 128], sh_num=25):
+        super().__init__()
+        self.decoder_albedo = Decoder_Albedo(decoder_dims, skip_dims)
+        self.decoder_transport = Decoder_Transport(decoder_dims, skip_dims, sh_num)
+        self.decoder_light = Decoder_Light(light_dims, sh_num)
+        
+    def forward(self, x):
+        albedo, bottle_a = self.decoder_albedo(x)
+        t_d, t_s, bottle_t = self.decoder_transport(x)
+        light = self.decoder_light(x[-1], bottle_a, bottle_t)
+        return t_d, t_s, albedo, light
+
+class S_Res(nn.Module):
+    def __init__(self, ):
+        super().__init__()
+        
+    def forward(self, ):
+        return 
 
 class ResidualBlock(nn.Module):
     def __init__(self, n_in, n_out, stride=1, ksize=3):
@@ -26,179 +274,6 @@ class ResidualBlock(nn.Module):
         h = F.relu(self.b1(self.c1(x)))
         h = self.b2(self.c2(h))
         return h + x
-
-class CNNAE2ResNet(nn.Module):
-
-    def __init__(self,in_channels=3,albedo_decoder_channels=4,train=True, sh_num=25):
-        super(CNNAE2ResNet,self).__init__()
-        self.sh_num = sh_num
-        self.c0 = nn.Conv2d(in_channels, 64, 4, stride=2, padding=1) # 1024 -> 512
-        nn.init.normal_(self.c0.weight, 0.0, 0.02)
-        self.c1 = nn.Conv2d(64, 128, 4, stride=2, padding=1,bias=False)  # 512 -> 256
-        nn.init.normal_(self.c1.weight, 0.0, 0.02)
-        self.c2 = nn.Conv2d(128, 256, 4, stride=2, padding=1,bias=False) # 256 -> 128
-        nn.init.normal_(self.c2.weight, 0.0, 0.02)
-        self.c3 = nn.Conv2d(256, 512, 4, stride=2, padding=1,bias=False) # 128 -> 64
-        nn.init.normal_(self.c3.weight, 0.0, 0.02)
-        self.c4 = nn.Conv2d(512, 512, 4, stride=2, padding=1,bias=False) # 64 -> 32
-        nn.init.normal_(self.c4.weight, 0.0, 0.02)
-
-        self.ra = ResidualBlock(512, 512)
-        self.rb = ResidualBlock(512, 512)
-
-        self.dc0a = nn.Conv2d(512,512,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc0a.weight, 0.0, 0.02)
-        self.up0a = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        self.dc1a = nn.Conv2d(1024, 512,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc1a.weight, 0.0, 0.02)
-        self.up1a = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-        self.dc2a = nn.Conv2d(256*3, 256,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc2a.weight, 0.0, 0.02)
-        self.up2a = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-        self.dc3a = nn.Conv2d(128*3, 128,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc3a.weight, 0.0, 0.02)
-        self.up3a = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dc3a1 = nn.Conv2d(128*3, 128,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc3a1.weight, 0.0, 0.02)
-        self.up3a1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-        self.dc4a = nn.Conv2d(64*3, 64,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc4a.weight, 0.0, 0.02)
-        self.up4a = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dc4a1 = nn.Conv2d(64*3, 64,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc4a1.weight, 0.0, 0.02)
-        self.up4a1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-        self.trans = nn.Conv2d(64, sh_num,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.trans.weight, 0.0, 0.02)
-        self.trans1 = nn.Conv2d(64, sh_num,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.trans1.weight, 0.0, 0.02)
-
-        self.dc0b = nn.Conv2d(512, 512,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc0b.weight, 0.0, 0.02)
-        self.up0b = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-        self.dc1b = nn.Conv2d(1024, 512,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc1b.weight, 0.0, 0.02)
-        self.up1b = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        self.dc2b = nn.Conv2d(256*3, 256,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc2b.weight, 0.0, 0.02)
-        self.up2b = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        self.dc3b = nn.Conv2d(128*3, 128,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc3b.weight, 0.0, 0.02)
-        self.up3b = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        self.dc4b = nn.Conv2d(64*3, 64,kernel_size=3,padding=1,bias=False)
-        nn.init.normal_(self.dc4b.weight, 0.0, 0.02)
-        self.up4b = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-        self.albedo = nn.Conv2d(64, albedo_decoder_channels,kernel_size=3,padding=1)
-        nn.init.normal_(self.albedo.weight, 0.0, 0.02)
-
-        self.tanh = nn.Tanh()
-        self.sig = nn.Sigmoid()
-
-        self.c0l = nn.Conv2d(512*3, 512, 4, stride=2, padding=1,bias=False) # 16 -> 8
-        nn.init.normal_(self.c0l.weight, 0.0, 0.02)
-        self.c1l = nn.Conv2d(512, 256, 4, stride=2, padding=1,bias=False) # 8 -> 4
-        nn.init.normal_(self.c1l.weight, 0.0, 0.02)
-        self.c2l = nn.Conv2d(256, 128, 4, stride=2, padding=1,bias=False) # 8 -> 4
-        nn.init.normal_(self.c2l.weight, 0.0, 0.02)
-        self.c3l = nn.Conv2d(128, sh_num * 3, 4, stride=2, padding=1) # 2 -> 1
-        nn.init.normal_(self.c3l.weight, 0.0, 0.02)
-            
-        self.bnc1 = nn.BatchNorm2d(128)
-        self.bnc2 = nn.BatchNorm2d(256)
-        self.bnc3 = nn.BatchNorm2d(512)
-        self.bnc4 = nn.BatchNorm2d(512)
-        self.bnc5 = nn.BatchNorm2d(512)
-
-        self.bndc0a = nn.BatchNorm2d(512)
-        self.bndc1a = nn.BatchNorm2d(512)
-        self.bndc2a = nn.BatchNorm2d(256)
-        self.bndc3a = nn.BatchNorm2d(128)
-        self.bndc3a1 = nn.BatchNorm2d(128)
-        self.bndc4a = nn.BatchNorm2d(64)
-        self.bndc4a1 = nn.BatchNorm2d(64)
-
-        self.bndc0b = nn.BatchNorm2d(512)
-        self.bndc1b = nn.BatchNorm2d(512)
-        self.bndc2b = nn.BatchNorm2d(256)
-        self.bndc3b = nn.BatchNorm2d(128)
-        self.bndc4b = nn.BatchNorm2d(64)
-            
-        self.bnc0l = nn.BatchNorm2d(512)
-        self.bnc1l = nn.BatchNorm2d(256)
-        self.bnc2l = nn.BatchNorm2d(128)
-        
-        self.train_dropout = train
-
-
-    def forward(self, xi):
-        hc0 = F.leaky_relu(self.c0(xi),inplace=True) # 64*256*256
-        hc1 = F.leaky_relu(self.bnc1(self.c1(hc0)),inplace=True) # 128*128*128
-        hc2 = F.leaky_relu(self.bnc2(self.c2(hc1)),inplace=True) # 256*64*64
-        hc3 = F.leaky_relu(self.bnc3(self.c3(hc2)),inplace=True) # 512*32*32
-        hc4 = F.leaky_relu(self.bnc4(self.c4(hc3)),inplace=True) # 512*16*16
-
-        # import ipdb; ipdb.set_trace()
-        if train_baseline == True:
-            hra = self.ra(hc4) # 512*16*16
-
-            ha = self.up0a(F.relu(F.dropout(self.bndc0a(self.dc0a(hra)), 0.5, training=self.train_dropout),inplace=True))
-            # till this line: 512*32*32
-            ha = torch.cat((ha,hc3),1)
-            ha = self.up1a(F.relu(F.dropout(self.bndc1a(self.dc1a(ha)), 0.5, training=self.train_dropout),inplace=True))
-            # till this line: 512*64*64
-            ha = torch.cat((ha,hc2),1)
-            ha = self.up2a(F.relu(F.dropout(self.bndc2a(self.dc2a(ha)), 0.5, training=self.train_dropout),inplace=True))
-            # till this line: 256*128*128
-            ha_inter = torch.cat((ha,hc1),1)
-            ha = self.up3a(F.relu(self.bndc3a(self.dc3a(ha_inter)),inplace=True))
-            ha1 = self.up3a1(F.relu(self.bndc3a1(self.dc3a1(ha_inter)),inplace=True))
-            # till this line: 128*256*256
-            ha = torch.cat((ha,hc0),1)
-            ha1 = torch.cat((ha1,hc0),1)
-            ha = self.up4a(F.relu(self.bndc4a(self.dc4a(ha)),inplace=True))
-            ha1 = self.up4a1(F.relu(self.bndc4a1(self.dc4a1(ha1)),inplace=True))
-            # till this line: 64*512*512
-            ha = self.trans(ha) # sh_num*512*512
-            ha1 = self.trans1(ha1) # sh_num*512*512
-
-        hrb = self.rb(hc4)
-        hb = self.up0b(F.relu(F.dropout(self.bndc0b(self.dc0b(hrb)), 0.5, training=self.train_dropout),inplace=True))
-        hb = torch.cat((hb,hc3),1)
-        hb = self.up1b(F.relu(F.dropout(self.bndc1b(self.dc1b(hb)), 0.5, training=self.train_dropout),inplace=True))
-        hb = torch.cat((hb,hc2),1)
-        hb = self.up2b(F.relu(F.dropout(self.bndc2b(self.dc2b(hb)), 0.5, training=self.train_dropout),inplace=True))
-        hb = torch.cat((hb,hc1),1)
-        hb = self.up3b(F.relu(self.bndc3b(self.dc3b(hb)),inplace=True))
-        hb = torch.cat((hb,hc0),1)
-        hb = self.up4b(F.relu(self.bndc4b(self.dc4b(hb)),inplace=True))
-        hb = self.albedo(hb)
-        
-        if train_baseline == True:
-            hb = self.sig(hb)
-        else:
-            pass
-        
-        if train_baseline == True:
-            hc = torch.cat((hc4, hra, hrb),1)
-            hc = F.leaky_relu(self.bnc0l(self.c0l(hc)),inplace=True) # 512*8*8
-            hc = F.leaky_relu(self.bnc1l(self.c1l(hc)),inplace=True) # 256*4*4
-            hc = F.leaky_relu(self.bnc2l(self.c2l(hc)),inplace=True) # 128*2*2
-            hc = torch.reshape(self.c3l(hc), (-1, self.sh_num, 3))
-            
-        # import ipdb; ipdb.set_trace()
-        if train_baseline == True:
-            return ha, ha1, hb, hc
-        else:
-            return hb
 
 class UnetGenerator(nn.Module):
     """Create a Unet-based generator"""
@@ -537,7 +612,7 @@ class ResnetGenerator(nn.Module):
 class ResnetBlock(nn.Module):
     """Define a Resnet block"""
 
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+    def __init__(self, dim, padding_type, norm, use_dropout, use_bias):
         """Initialize the Resnet block
 
         A resnet block is a conv block with skip connections
@@ -546,21 +621,22 @@ class ResnetBlock(nn.Module):
         Original Resnet paper: https://arxiv.org/pdf/1512.03385.pdf
         """
         super(ResnetBlock, self).__init__()
-        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+        self.conv_block = self.build_conv_block(dim, padding_type, norm, use_dropout, use_bias)
 
-    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+    def build_conv_block(self, dim, padding_type, norm, use_dropout, use_bias):
         """Construct a convolutional block.
 
         Parameters:
             dim (int)           -- the number of channels in the conv layer.
             padding_type (str)  -- the name of padding layer: reflect | replicate | zero
-            norm_layer          -- normalization layer
+            norm (str)          -- normalization layer
             use_dropout (bool)  -- if use dropout layers.
             use_bias (bool)     -- if the conv layer uses bias or not
 
         Returns a conv block (with a conv layer, a normalization layer, and a non-linearity layer (ReLU))
         """
         conv_block = []
+        norm_layer = norm_type[norm]
         p = 0
         if padding_type == 'reflect':
             conv_block += [nn.ReflectionPad2d(1)]
@@ -723,7 +799,59 @@ class GANLoss(nn.Module):  # 继承nn.Module时，需要用到super函数；数�
         loss = self.loss(input, target_label)
         return loss
 
+def get_LoG_kernel(size, sigma, device):
+    lin = torch.linspace(-(size - 1) // 2, size // 2, size, device=device)
+    [x, y] = torch.meshgrid(lin, lin, indexing='ij')
+    ss = sigma ** 2
+    xx = x * x
+    yy = y * y
+    g_div_ss = torch.exp(-(xx + yy) / (2. * ss)) / (2. * torch.pi * (ss ** 2))
+    a = (xx + yy - 2. * ss) * g_div_ss
 
+    # Normalize.
+    a = a - a.sum() / size ** 2
+    return a
+
+def get_LoG_filter(num_channels, sigma, device='cuda'):
+    kernel_size = int(torch.ceil(8. * sigma))
+    # Make into odd number.
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    kernel = get_LoG_kernel(kernel_size, sigma, device)
+    # [kH, kW] => [OutChannels, (InChannels / groups) => 1, kH, kW].
+    kernel = kernel.view(1, 1, kernel_size, kernel_size)
+    kernel = kernel.repeat(num_channels, 1, 1, 1)
+
+    # Create filter.
+    filter = torch.nn.Conv2d(in_channels=num_channels, out_channels=num_channels,
+                            kernel_size=kernel_size, groups=num_channels, bias=False,
+                             padding=kernel_size // 2, padding_mode='reflect')
+    filter.weight.data = kernel
+    filter.weight.requires_grad = False
+
+    return filter
+
+class SpatialFrequencyLoss(nn.Module):
+    def __init__(self, num_channels=3, device='cuda', debug = False):
+        super(SpatialFrequencyLoss, self).__init__()
+        self.debug = debug
+
+        self.sigmas = torch.tensor([0.6, 1.2, 2.4, 4.8, 9.6, 19.2]).to(device)
+        self.w_sfl = torch.tensor([600, 500, 400, 20, 10, 10]).to(device)
+        self.num_filters = len(self.sigmas)
+
+        self.filters = []
+        for x in range(self.num_filters):
+            filter = get_LoG_filter(num_channels, self.sigmas[x], device)
+            self.filters.append(filter)
+    def forward(self, input, target):
+        loss = 0.
+        for x in range(self.num_filters):
+            input_LoG = self.filters[x](input)
+            target_LoG = self.filters[x](target)
+            loss += self.w_sfl[x] * F.mse_loss(input_LoG, target_LoG)
+        return loss
 
 def init_weights(net, init_type='normal', init_gain=0.02):
     def init_func(m):  # define the initialization function
@@ -738,25 +866,17 @@ def init_weights(net, init_type='normal', init_gain=0.02):
             init.normal_(m.weight.data, 1.0, init_gain)
             init.constant_(m.bias.data, 0.0)
 
-    # print('initialize network with %s' % init_type)
+    print('initialize network with %s' % init_type)
     net.apply(init_func)  # apply the initialization function <init_func>
 
 
-def init_net(net, local_rank, init_type='normal', init_gain=0.02):
-    device = torch.device('cuda', local_rank)
-    net.to(device)
+def init_net(net, init_type='normal', init_gain=0.02):
     init_weights(net, init_type, init_gain=init_gain)
     return net
 
-
-def define_G(input_nc, output_nc, ngf, local_rank, normal=False, init_type='normal', init_gain=0.02, Net="Unet"):
-    if Net == 'Unet':
-        net = UnetGenerator(input_nc, output_nc, ngf, normal=normal)
-    elif Net == "Res":
-        net = ResnetGenerator(input_nc, output_nc, ngf, use_dropout=False)
-    else:
-        net = specular(input_nc, output_nc, ngf)
-    return init_net(net, local_rank, init_type, init_gain)
+def define_G(sh_num, use_res, init_type='normal', init_gain=0.02, Net="Unet"):
+    net = VideoRelight(sh_num=sh_num, use_res=use_res)
+    return init_net(net, init_type, init_gain)
 
 
 def define_D(input_nc, ngf, local_rank, init_type='normal', init_gain=0.02):

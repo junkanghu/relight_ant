@@ -23,9 +23,11 @@ def get_opt():
                         help='Output directory')
     parser.add_argument('--log_dir', type=str, default='train.log',
                         help='log directory')
+    parser.add_argument('--yaml_dir', default='/nas/home/hujunkang/data.yaml', help='Directory for test input images')
+    parser.add_argument('--light_dir', '-l0', default="/nas/home/hujunkang/sh_hdr", help='Light directory for training')
 
     parser.add_argument('--save_fre', type=int, default=5)
-    parser.add_argument('--val_fre', type=int, default=5)
+    parser.add_argument('--val_fre', type=int, default=1)
 
     parser.add_argument('--test_dir', type=str, 
                         help='Test data directory')
@@ -37,12 +39,12 @@ def get_opt():
                         help='Learning rate for training')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='batch size for training')
+
     parser.add_argument('--res_epoch', type=int, default=30,
                         help='when to start training the residual net')
-
-    parser.add_argument('--yaml_dir', default='/nas/home/hujunkang/data.yaml', help='Directory for test input images')
-    parser.add_argument('--light_dir', '-l0', default="/nas/home/hujunkang/sh_hdr", help='Light directory for training')
+    parser.add_argument('--use_res', action="store_true", help="whether to use shading residual")
     parser.add_argument('--sh_num', default=25, type=int, help='number of sh coefficients')
+
     # weight
     parser.add_argument('--w_transport', '-tw0', default=1., type=float, help='')
     parser.add_argument('--w_albedo', '-tw1', default=1., type=float, help='')
