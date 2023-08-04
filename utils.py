@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+import logging
+from torch.utils.tensorboard import SummaryWriter
 
 def workspace_config(opt):
     workspace = os.getenv('workspace')
@@ -50,6 +52,13 @@ def init_distributed_mode(args):
         print('[INFO] turn on distributed train', flush=True)
     else:
         print('[INFO] turn off distributed train', flush=True)
+
+def init(opt):
+    init_distributed_mode(opt)
+    logging.basicConfig(filename=opt.log_dir, filemode='a', format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.INFO)
+    if opt.rank == 0:
+        writer = SummaryWriter(opt.out_dir)
+    return writer
 
 @torch.no_grad()
 def gaussian(window_size, sigma):

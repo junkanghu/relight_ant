@@ -2,8 +2,7 @@ from data.TrainDataset import create_dataset
 from option import get_opt
 from models.TrainModel import lumos
 from tqdm import tqdm
-from utils import init_distributed_mode
-from torch.utils.tensorboard import SummaryWriter
+from utils import init
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -13,8 +12,7 @@ import os
 if __name__ == "__main__":
     # torch.backends.cudnn.benchmark = True
     opt = get_opt()
-    init_distributed_mode(opt)
-    logging.basicConfig(filename=opt.log_dir, filemode='a', format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.INFO)
+    writer = init(opt)
     dataloader_train, dataloader_val = create_dataset(opt)
     model = lumos(opt).to(torch.device("cuda", opt.local_rank))
 
@@ -25,8 +23,6 @@ if __name__ == "__main__":
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
         logging.info(f"WorldSize {os.environ['WORLD_SIZE']} Rank {os.environ['RANK']} Local_Rank {os.environ['LOCAL_RANK']}")
-    if opt.rank == 0:
-        writer = SummaryWriter(opt.out_dir)
     start_epoch = get_model(model).load_ckpt()
     for epoch in tqdm(range(start_epoch, opt.epochs + 1), ascii=True, desc='epoch'):
         if opt.distributed:
