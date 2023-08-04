@@ -13,8 +13,8 @@ def get_opt():
     parser.add_argument('--dist_backend', default='nccl', help='which backend to use')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--local_rank', type=int, default=0, help='gpu id for current process')
-    parser.add_argument('--rank', type=int, default=None, help='rank id among all the world process')
-    parser.add_argument('--world_size', type=int, default=None, help='total number of ddp processes')
+    parser.add_argument('--rank', type=int, default=0, help='rank id among all the world process')
+    parser.add_argument('--world_size', type=int, default=1, help='total number of ddp processes')
     parser.add_argument('--data_load_works', type=int, default=4, help='dataloader workers for loading data')
 
     parser.add_argument('--data_dir', type=str, 

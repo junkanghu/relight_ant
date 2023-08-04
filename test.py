@@ -11,6 +11,5 @@ if __name__ == "__main__":
     dataloader_test = create_dataset(opt, dataset_test, shuffle=False, val=True)
     for i, data in enumerate(dataloader_test):
         model.set_input(data)
-        model.eval()
         model.test()
     model.print_metric()

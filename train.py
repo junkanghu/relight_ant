@@ -25,9 +25,7 @@ if __name__ == "__main__":
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
         logging.info(f"WorldSize {os.environ['WORLD_SIZE']} Rank {os.environ['RANK']} Local_Rank {os.environ['LOCAL_RANK']}")
-        if dist.get_rank() == 0:
-            writer = SummaryWriter(opt.out_dir)
-    else:
+    if opt.rank == 0:
         writer = SummaryWriter(opt.out_dir)
     start_epoch = get_model(model).load_ckpt()
     for epoch in tqdm(range(start_epoch, opt.epochs + 1), ascii=True, desc='epoch'):
@@ -36,40 +34,23 @@ if __name__ == "__main__":
         for i, data in tqdm(enumerate(dataloader_train), ascii=True, desc='training iterations'):
             get_model(model).set_input(data)
             get_model(model).optimize_parameters(epoch)
-            if (opt.distributed and dist.get_rank() == 0) or not opt.distributed:
+            if opt.rank == 0:
                 get_model(model).gather_loss()
 
         get_model(model).update_lr(epoch)
-        if (opt.distributed and dist.get_rank() == 0) or not opt.distributed:
-            # print losses and add them to writer
-            loss = get_model(model).gather_loss(True)
-            out = "[Epoch {} ]".format(epoch)
-            for idx, key in enumerate(loss.keys()):
-                average = loss[key] / (i + 1)
-                writer.add_scalar(key, average, epoch)
-                out += (key + ": " + str(average) + ("\n" if idx == len(loss.keys()) - 1 else " "))
+        if opt.rank == 0:
+            out = get_model(model).get_print_format(epoch, writer, i + 1)
             tqdm.write(out)
             logging.info(out)
-            
-            # save ckpt
-            if epoch % opt.save_fre == 0:
+            if epoch % opt.save_fre == 0: # save ckpt
                 get_model(model).save_ckpt(epoch)
 
         if epoch % opt.val_fre == 0:
-            ssim = []
-            psnr = []
             for i, data in enumerate(dataloader_val):
-                with torch.no_grad():
-                    get_model(model).set_input(data)
-                    get_model(model).eval()
-                    get_model(model).forward()
-                    ssim_batch, psnr_batch = get_model(model).plot(epoch)
-                    get_model(model).train()
-                    ssim += ssim_batch
-                    psnr += psnr_batch
+                get_model(model).set_input(data)
+                get_model(model).val(epoch)
             
-            if (opt.distributed and dist.get_rank() == 0) or not opt.distributed:
-                ssim = sum(ssim) / len(ssim)
-                psnr = sum(psnr) / len(psnr)
+            if opt.rank == 0:
+                ssim, psnr = get_model(model).print_metric()
                 writer.add_scalar('ssim', ssim, epoch)
                 writer.add_scalar('psnr', psnr, epoch)

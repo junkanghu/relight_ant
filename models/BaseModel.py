@@ -87,8 +87,10 @@ class BaseModel(torch.nn.Module):
             img.save(img_dir)
 
             # calculate ssim and psnr
-            psnr_group.append(psnr(((self.input[id] * 0.5 + 0.5) * self.mask[id]).detach(), self.rendering[id].detach()))
-        ssim_batch = [ssim(((self.input * 0.5 + 0.5) * self.mask).detach(), self.rendering.detach())]
+            psnr_group.append(psnr(((self.input[id] * 0.5 + 0.5) * self.mask[id]).detach(),
+                                self.rendering[id].detach() if not self.opt.use_res else self.rendering_final[id].detach()))
+        ssim_batch = [ssim(((self.input * 0.5 + 0.5) * self.mask).detach(),
+                        self.rendering.detach() if not self.opt.use_res else self.rendering_final.detach())]
         return ssim_batch, psnr_group
 
     def eval(self):
@@ -109,11 +111,30 @@ class BaseModel(torch.nn.Module):
         self.ssim += ssim_batch
         self.psnr += psnr_batch
         
+    def reset_metric(self):
+        self.ssim = []
+        self.psnr = []
+        
     def print_metric(self):
+        self.train() # After running the val or test data, set the model to train mode.
         ssim = sum(self.ssim) / len(self.ssim)
         psnr = sum(self.psnr) / len(self.psnr)
+        self.reset_metric() # After validation of current epoch, reset the metrics.
         print("SSIM: %.3f" % ssim)
         print("PSNR: %.3f" % psnr)
+        return ssim, psnr
+    
+    def val(self, epoch):
+        """Process the test data with the trained model.
+
+        Args:
+            end (bool, optional): In the end, print metrics. Defaults to False.
+        """           
+        with torch.no_grad():
+            self.eval()
+            self.forward()
+            ssim_batch, psnr_batch = self.plot(epoch)
+            self.cal_metric(ssim_batch, psnr_batch)
         
     def test(self):
         """Process the test data with the trained model.
@@ -122,6 +143,7 @@ class BaseModel(torch.nn.Module):
             end (bool, optional): In the end, print metrics. Defaults to False.
         """           
         with torch.no_grad():
+            self.eval()
             self.forward()
             ssim_batch, psnr_batch = self.plot()
             self.cal_metric(ssim_batch, psnr_batch)
@@ -230,3 +252,13 @@ class BaseModel(torch.nn.Module):
                 continue
             value = getattr(self, 'loss_' + name).item()
             self.loss_all[name] += value
+            
+    def get_print_format(self, epoch, writer, n_batch):
+        # print losses and add them to writer
+        loss = self.gather_loss(True)
+        out = "[Epoch {} ]".format(epoch)
+        for idx, key in enumerate(loss.keys()):
+            average = loss[key] / n_batch
+            writer.add_scalar(key, average, epoch)
+            out += (key + ": " + str(average) + ("\n" if idx == len(loss.keys()) - 1 else " "))
+        return out
