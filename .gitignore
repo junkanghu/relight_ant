@@ -1,2 +1,6 @@
 configs/local/
 scripts/local/
+results/
+result*/
+__pycache__/
+.vscode/
