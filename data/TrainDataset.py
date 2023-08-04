@@ -96,7 +96,9 @@ class Dataset(torch.utils.data.Dataset):
         
         if self.opt.use_res:
             bprt_d = Image.open(self.bprt_d_dir[idx1])
+            bprt_d = self.transform_img(bprt_d)
             bshading = Image.open(self.bshading_dir[idx1]) # srgb
+            bshading = self.transform_img(bshading)
             return_dict.update({
                 'bprt_d': bprt_d,
                 'bshading': bshading

@@ -26,8 +26,14 @@ class lumos(BaseModel):
         self.optimizer_name = ['optim_main']
         self.net_name = ['main']
         
-        self.net_main = networks.define_G(opt.sh_num, opt.use_res)
+        self.net_main = networks.define_G(opt.sh_num)
         self.optim_main = torch.optim.Adam(self.net_main.parameters(),lr=opt.lr, betas=(0.5, 0.999))
+
+        if opt.use_res:
+            self.optimizer_name.append('optim_residual')
+            self.net_name.append('residual')
+            self.net_residual = networks.define_G(opt.sh_num, is_res=True)
+            self.optim_residual = torch.optim.Adam(self.net_residual.parameters(),lr=opt.lr, betas=(0.5, 0.999))
 
         self.loss_name = self.get_loss_name()
         self.initialize_loss()
@@ -61,7 +67,7 @@ class lumos(BaseModel):
         self.diffuse = self.albedo_hat * self.shading_all_hat
         self.rendering = self.diffuse + self.albedo_hat * self.sepc_all_hat
         
-        if self.epoch > self.opt.res_epoch or self.opt.test:
+        if self.opt.use_res and self.epoch >= self.opt.res_epoch:
             self.shading_res = self.net_residual(torch.cat([self.shading_all_hat.detach(), 
                                 self.transport_d_hat.detach()], 1), self.light_hat.detach()) * self.mask
             self.shading_final = l2srgb(self.shading_all_hat_linear + self.shading_res) * self.mask
@@ -131,7 +137,7 @@ class lumos(BaseModel):
             self.opt.w_shading_all * (L_spec_all + L_spec_all1) * 0.5 +\
             self.opt.w_rendering_all * (L_rendering_all1 + L_rendering_all2 + L_rendering_all3) * 0.5
             
-        if self.epoch > self.opt.res_epoch:
+        if self.opt.use_res and self.epoch >= self.opt.res_epoch:
             L_shading_final = self.loss_l1(self.shading_final, self.bshading)
             L_shading_sf = self.sf_loss(self.shading_final, self.bshading)
             L_rendering_diff = self.loss_l1(self.diffuse_final, self.bprt_d)
@@ -149,19 +155,20 @@ class lumos(BaseModel):
         self.optim_main.step()       # update G_A and G_B's weights
     
     def concat_img(self, id):
-        if self.epoch > self.opt.res_epoch:
+        if self.opt.use_res and self.epoch >= self.opt.res_epoch:
             output_vs_gt_plot = torch.cat([
                                 self.albedo_hat[id:id+1].detach(), 
                                 self.albedo[id:id+1].detach(), 
                                 self.shading_all_hat[id:id+1].detach(),
                                 self.shading[id:id+1].detach(),
-                                self.shading_final.detach(),
-                                self.bshading[id: id+1].detach(),
+                                l2srgb(self.shading_res[id:id+1].detach()),
+                                self.shading_final[id:id+1].detach(),
+                                self.bshading[id:id+1].detach(),
                                 self.sepc_all_hat[id:id+1].detach(),
                                 self.prt_s[id:id+1].detach(),
                                 self.diffuse[id:id+1].detach(),
                                 self.prt_d[id:id+1].detach(),
-                                self.diffuse_final.detach(),
+                                self.diffuse_final[id:id+1].detach(),
                                 self.bprt_d[id:id+1].detach(),
                                 self.rendering[id:id+1].detach(),
                                 self.rendering_final[id:id+1].detach(),

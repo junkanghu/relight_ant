@@ -24,22 +24,16 @@ class VideoRelight(nn.Module):
     def __init__(self, encoder_dims=[3, 64, 128, 256, 512, 512],
                 decoder_dims=[512, 512, 256, 128, 64, 32],
                 skip_dims=[512, 256, 128, 64, 0],
-                light_dims=[512*3, 512, 256, 128], sh_num=25, use_res=False):
+                light_dims=[512*3, 512, 256, 128], sh_num=25):
         super().__init__()
-        self.use_res = use_res
         self.encoder = Encoder(encoder_dims)
         self.decoder = Decoder(decoder_dims, skip_dims, light_dims, sh_num)
-        if use_res:
-            self.shading_res = S_Res()
         
     def forward(self, x):
         x = self.encoder(x)
         t_d, t_s, albedo, light = self.decoder(x)
-        if not self.use_res:
-            return t_d, t_s, albedo, light
-        res = self.shading_res(t_d, light)
-        return t_d, t_s, albedo, light, res
-    
+        return t_d, t_s, albedo, light
+
 class ConvBlock(nn.Module):
     def __init__(self, in_nc, out_nc,
                 kernel_size, stride, padding, bias=False,
@@ -74,17 +68,18 @@ class ConvBlock(nn.Module):
         return self.model(x)
 
 class Encoder(nn.Module):
-    def __init__(self, dims:list):
+    def __init__(self, dims:list, lr_slope=0.01):
         """
         Args:
             dims (list): Features dimensions. The first is the input one.
+            lr_slope (float, optional): Used for LeakyRelu
         """        
         super().__init__()
         self.n_layer = len(dims) - 1
         for i in range(self.n_layer):
             setattr(self, "e{}".format(i),
                     ConvBlock(dims[i], dims[i+1], 4, 2, 1,
-                                norm="batch" if i > 0 else None, ac="leakyrelu"))
+                                norm="batch" if i > 0 else None, ac="leakyrelu", lr_slope=lr_slope))
         
     def forward(self, x):
         out = []
@@ -250,13 +245,61 @@ class Decoder(nn.Module):
         t_d, t_s, bottle_t = self.decoder_transport(x)
         light = self.decoder_light(x[-1], bottle_a, bottle_t)
         return t_d, t_s, albedo, light
+    
+class Decoder_Res(nn.Module):
+    def __init__(self, decoder_dims, skip_dims, lr_slope=0.01):
+        """Branch for shading residual.
 
-class S_Res(nn.Module):
-    def __init__(self, ):
+        Args:
+            decoder_dims (list): Dimensions of features in the decoder.
+            skip_dims (list): Dimensions of features from encoder.
+            lr_slope (float): Used for LeakyRelu.
+        """        
         super().__init__()
+        self.bottlneck = ResnetBlock(decoder_dims[0], 'zero', "batch", False, True)
+        self.n_layer = len(decoder_dims) - 1
+        for i in range(self.n_layer):
+            setattr(self, "up{}".format(i),
+                UpsamplingBlock(decoder_dims[i], skip_dims[i], decoder_dims[i+1], 3, 1, 1,
+                    norm="batch", ac="relu", dropout=True if i < 2 else False, lr_slope=lr_slope))
+        self.fc_light = nn.Linear(25*3, decoder_dims[0])
+        self.up_light = nn.Upsample(scale_factor=16)
+        self.fusion = ConvBlock(decoder_dims[0]*2, decoder_dims[0], 3, 1, 1, ac="leakyrelu", lr_slope=0.2)
+        self.out = nn.Sequential(ConvBlock(decoder_dims[-1], 8, 3, 1, 1),
+                                ConvBlock(8, 3, 3, 1, 1))
         
-    def forward(self, ):
-        return 
+    def forward(self, x, light):
+        """Use transport_d & shading & light to predict the residual.
+
+        Args:
+            x: Features from encoder.
+            light: Light parameters. Shape: [B, 25, 3]
+
+        Returns:
+            Shading residual which is to be added to the original shading.
+        """        
+        inter = self.bottlneck(x[-1])
+        light = torch.flatten(light, 1)
+        light = self.up_light(self.fc_light(light).unsqueeze(-1).unsqueeze(-1))
+        inter = self.fusion(torch.cat([inter, light], 1))
+        for i in range(self.n_layer):
+            layer = getattr(self, "up{}".format(i))
+            inter = layer(inter, x[-(i + 2)] if not i == self.n_layer - 1 else None)
+        inter = self.out(inter)
+        return inter
+
+class ShadingRes(nn.Module):
+    def __init__(self, encoder_dims=[28, 32, 64, 128, 256, 256],
+                decoder_dims=[256, 256, 128, 64, 32, 16],
+                skip_dims=[256, 128, 64, 32, 0]):
+        super().__init__()
+        self.encoder = Encoder(encoder_dims, lr_slope=0.2)
+        self.decoder = Decoder_Res(decoder_dims, skip_dims, lr_slope=0.2)
+        
+    def forward(self, x, light):
+        x = self.encoder(x)
+        res = self.decoder(x, light)
+        return res
 
 class ResidualBlock(nn.Module):
     def __init__(self, n_in, n_out, stride=1, ksize=3):
@@ -874,8 +917,8 @@ def init_net(net, init_type='normal', init_gain=0.02):
     init_weights(net, init_type, init_gain=init_gain)
     return net
 
-def define_G(sh_num, use_res, init_type='normal', init_gain=0.02, Net="Unet"):
-    net = VideoRelight(sh_num=sh_num, use_res=use_res)
+def define_G(sh_num, is_res=False, init_type='normal', init_gain=0.02, Net="Unet"):
+    net = VideoRelight(sh_num=sh_num) if not is_res else ShadingRes()
     return init_net(net, init_type, init_gain)
 
 

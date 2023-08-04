@@ -11,7 +11,10 @@
             "program": "${file}",
             "args": [
                 "--config", "./configs/train.yml",
-                "--batch_size", "8"
+                "--batch_size", "8",
+                "--out_dir", "debug",
+                "--use_res",
+                "--res_epoch", "1"
             ],
             "env": {
                 "OMP_NUM_THREADS": "32",

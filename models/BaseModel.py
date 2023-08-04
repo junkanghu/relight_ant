@@ -36,10 +36,11 @@ class BaseModel(torch.nn.Module):
         self.device = torch.device("cuda", opt.local_rank)
         self.name = None # Validation or test image name.
         self.loss_name = None
+        self.loss_res = None
         self.epoch = 1
         self.loss_all = {}
         self.net_name = []
-        self.optimizer_name = ['optim_main']
+        self.optimizer_name = []
         self.ssim = []
         self.psnr = []
 
@@ -69,7 +70,7 @@ class BaseModel(torch.nn.Module):
             out = torchvision.utils.make_grid(output_vs_gt_plot,
                                             scale_each=False,
                                             normalize=False,
-                                            nrow=2 if self.opt.test else 5).detach().cpu().numpy()
+                                            nrow=4 if self.opt.test else 5).detach().cpu().numpy()
             out = out.transpose(1, 2, 0)
             out = np.clip(out, 0.01, 0.99)
             scale_factor = 255
@@ -162,13 +163,23 @@ class BaseModel(torch.nn.Module):
         ckpt = torch.load(ckpt_dir, map_location=self.device)
         
         for name in self.net_name:
-            if isinstance(name, str):
+            if isinstance(name, str) and name in list(ckpt.keys()):
                 net = getattr(self, 'net_' + name)
-                net.load_state_dict(ckpt[name])
+                weight = ckpt[name]
+                cur_weight = net.state_dict()
+                if len(list(cur_weight.keys())) == len(list(weight.keys())):
+                    net.load_state_dict(weight)
+                    continue
+                new_model_state_dict = {}
+                for key, value in cur_weight.items():
+                    new_model_state_dict[key] = value
+                for key, value in weight.items():
+                    new_model_state_dict[key] = value
+                net.load_state_dict(new_model_state_dict)
 
         start_epoch = ckpt["epoch"] + 1
         for name in self.optimizer_name:
-            if isinstance(name, str):
+            if isinstance(name, str) and name in list(ckpt.keys()):
                 optimizer = getattr(self, name)
                 optimizer.load_state_dict(ckpt[name])
         return start_epoch
@@ -215,7 +226,7 @@ class BaseModel(torch.nn.Module):
             return loss_all
 
         for idx, name in enumerate(self.loss_name):
-            if self.epoch <= self.opt.res_epoch and name == 'res':
+            if self.epoch < self.opt.res_epoch and name == 'res':
                 continue
             value = getattr(self, 'loss_' + name).item()
             self.loss_all[name] += value
