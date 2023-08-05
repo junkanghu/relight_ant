@@ -151,8 +151,12 @@ class lumos(BaseModel):
         self.forward()
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
         self.optim_main.zero_grad()  # set G_A and G_B's gradients to zero
+        if self.opt.use_res and self.epoch >= self.opt.res_epoch:
+            self.optim_residual.zero_grad()
         self.backward_G()             # calculate gradients for G_A and G_B
         self.optim_main.step()       # update G_A and G_B's weights
+        if self.opt.use_res and self.epoch >= self.opt.res_epoch:
+            self.optim_residual.step()
     
     def concat_img(self, id):
         if self.opt.use_res and self.epoch >= self.opt.res_epoch:
