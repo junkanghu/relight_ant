@@ -17,6 +17,9 @@ def get_opt():
     parser.add_argument('--world_size', type=int, default=1, help='total number of ddp processes')
     parser.add_argument('--data_load_works', type=int, default=4, help='dataloader workers for loading data')
 
+    # Dir-related
+    parser.add_argument('--test_dir', type=str, 
+                        help='Test data directory')
     parser.add_argument('--data_dir', type=str, 
                         help='Data directory')
     parser.add_argument('--out_dir', type=str, default='results',
@@ -29,10 +32,7 @@ def get_opt():
     parser.add_argument('--save_fre', type=int, default=5)
     parser.add_argument('--val_fre', type=int, default=1)
 
-    parser.add_argument('--test_dir', type=str, 
-                        help='Test data directory')
-
-    # model-dependent options
+    # Base config
     parser.add_argument('--epochs', type=int, default=200,
                         help='Epoch for training')
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -40,6 +40,9 @@ def get_opt():
     parser.add_argument('--batch_size', type=int, default=1,
                         help='batch size for training')
 
+    # Model-dependent options
+    parser.add_argument('--tfa_att', action="store_true", help='Feature alignment algorithms. Default is deform conv.')
+    parser.add_argument('--video', action="store_true", help='train for video stage')
     parser.add_argument('--res_epoch', type=int, default=30,
                         help='when to start training the residual net')
     parser.add_argument('--use_res', action="store_true", help="whether to use shading residual")

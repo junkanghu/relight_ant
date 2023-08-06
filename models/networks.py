@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import functools
+from attend import Attend
 import numpy as np
 from torch.nn import init
 from torch.optim import lr_scheduler
@@ -8,6 +9,8 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from antialiased_cnns.blurpool import BlurPool
 import math
+from deform_conv import ModulatedDeformConvPack as DCN
+from attend import TFA_Attention
 ac_type = {
     "relu": nn.ReLU,
     "leakyrelu": nn.LeakyReLU,
@@ -81,13 +84,25 @@ class Encoder(nn.Module):
                     ConvBlock(dims[i], dims[i+1], 4, 2, 1,
                                 norm="batch" if i > 0 else None, ac="leakyrelu", lr_slope=lr_slope))
         
-    def forward(self, x):
+    def forward_single_frame(self, x):
         out = []
         for i in range(self.n_layer):
             block = getattr(self, "e{}".format(i))
             x = block(x)
             out.append(x)
         return out
+
+    def forward_time_series(self, x):
+        B, T = x.shape[:2]
+        features = self.forward_single_frame(x.flatten(0, 1))
+        features = [f.unflatten(0, (B, T)) for f in features]
+        return features
+
+    def forward(self, x):
+        if x.ndim == 5:
+            return self.forward_time_series(x)
+        else:
+            return self.forward_single_frame(x)
 
 class UpsamplingBlock(nn.Module):
     def __init__(self, in_nc, skin_nc, out_nc,
@@ -301,356 +316,55 @@ class ShadingRes(nn.Module):
         res = self.decoder(x, light)
         return res
 
-class ResidualBlock(nn.Module):
-    def __init__(self, n_in, n_out, stride=1, ksize=3):
-        w = math.sqrt(2)
+class DeformConv(nn.Module):
+    def __init__(self, nf, groups=8):
+        super(DeformConv, self).__init__()
+        self.off_conv1 = nn.Conv2d(nf*2, nf, 3, 1, 1, bias=True)
+        self.off_conv2 = nn.Conv2d(nf  , nf, 3, 1, 1, bias=True)
+        self.dcnpack = DCN(nf, nf, kernel_size=3, stride=1, padding=1, dilation=1, deformable_groups=groups, extra_offset_mask=True)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
+
+    def forward(self, nbr, ref):
+        """Temporal Feature Alignment block.
+        We take the middle feature as the reference one. By default, the frame number is odd.
+
+        Args:
+            nbr (tensor): Neighboring features. Shape: [B, F, C, H, W]
+            ref (tensor): Reference features which is the expanded middle one of nbr. Shape: [B, F, C, H, W]
+
+        Returns:
+            tensor: aligned features.
+        """        
+        b, f, _ = nbr.shape
+        off = self.lrelu(self.off_conv1(torch.cat([nbr.flatten(0, 1), ref.flatten(0, 1)], dim=1)))
+        off = self.lrelu(self.off_conv2(off))
+        fea = self.dcnpack([nbr, off]).unflatten(0, (b, f)) # Shape: [B, F, C, H, W]
+        return fea
+    
+class TFA_Block(nn.Module):
+    def __init__(self, in_nc, is_att=False):
+        """Align all the temporal features according to the reference feature map.
+
+        Args:
+            in_nc (int): Input and output feature dimensions.
+            is_att (bool, optional): When set true, use cross attention for TFA, otherwise deform conv. Defaults to False.
+        """        
         super().__init__()
-
-        self.c1=nn.Conv2d(n_in, n_out, ksize, stride=stride, padding = 1)
-        nn.init.constant_(self.c1.weight, w)
-        self.c2=nn.Conv2d(n_out, n_out, ksize, stride=1, padding = 1)
-        nn.init.constant_(self.c2.weight, w)
-        self.b1=nn.BatchNorm2d(n_out)
-        self.b2=nn.BatchNorm2d(n_out)
-
-    def forward(self, x):
-        h = F.relu(self.b1(self.c1(x)))
-        h = self.b2(self.c2(h))
-        return h + x
-
-class UnetGenerator(nn.Module):
-    """Create a Unet-based generator"""
-
-    def __init__(self, input_nc, output_nc, ngf=32, normal=False):
-        """Construct a Unet generator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            output_nc (int) -- the number of channels in output images
-            num_downs (int) -- the number of downsamplings in UNet. For example, # if |num_downs| == 7,      下采样的次数（每次对半）
-                                image of size 128x128 will become of size 1x1 # at the bottleneck
-            ngf (int)       -- the number of filters in the last conv layer
-            norm_layer      -- normalization layer
-        """
-        super(UnetGenerator, self).__init__()
-        self.normal = normal
-        self.e1 = nn.Sequential(*[
-            nn.Conv2d(input_nc, 32, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-        ])
-        self.e2 = nn.Sequential(*[
-            nn.Conv2d(32, 64, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(64, stride=2)
-        ])
-        self.e3 = nn.Sequential(*[
-            nn.Conv2d(64, 128, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(128, stride=2)
-        ])
-        self.e4 = nn.Sequential(*[
-            nn.Conv2d(128, 256, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(256, stride=2)
-        ])
-        self.e5 = nn.Sequential(*[
-            nn.Conv2d(256, 512, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(512, stride=2)
-        ])
-        self.e6 = nn.Sequential(*[
-            nn.Conv2d(512, 512, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(512, stride=2)
-        ])
-        self.bottle = nn.Sequential(*[
-            nn.Conv2d(512, 512, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(512, stride=2)
-        ])
-        self.d1 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(512, 512, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d2 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(1024, 512, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d3 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(1024, 256, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d4 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(512, 128, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d5 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(256, 64, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d6 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(128, 32, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-
-
-        if normal:
-            self.d5_l = nn.Sequential(*[
-                nn.Upsample(scale_factor=2, mode='bilinear'),
-                nn.Conv2d(256, 64, 3, 1, 1, bias=True),
-                nn.LeakyReLU(0.2, True)
-            ])
-            self.d6_l = nn.Sequential(*[
-                nn.Upsample(scale_factor=2, mode='bilinear'),
-                nn.Conv2d(128, 32, 3, 1, 1, bias=True),
-                nn.LeakyReLU(0.2, True)
-            ])
-
-            self.out = nn.Sequential(*[
-                nn.Conv2d(64, 32, 3, 1, 1, bias=True),
-                nn.LeakyReLU(0.2, True),
-                nn.Conv2d(32, output_nc // 2, 1, 1)
-            ])
-            self.out_l = nn.Sequential(*[
-                nn.Conv2d(64, 32, 3, 1, 1, bias=True),
-                nn.LeakyReLU(0.2, True),
-                nn.Conv2d(32, output_nc // 2, 1, 1)
-            ])
-        else:
-            self.out = nn.Sequential(*[
-                nn.Conv2d(32, 32, 3, 1, 1, bias=True),
-                nn.LeakyReLU(0.2, True),
-                nn.Conv2d(32, output_nc, 1, 1),
-                # nn.ReLU()
-            ])
-
-
-    def forward(self, x):
-        o1 = self.e1(x)
-        o2 = self.e2(o1)
-        o3 = self.e3(o2)
-        o4 = self.e4(o3)
-        o5 = self.e5(o4)
-        o6 = self.e6(o5)
-        bottle = self.bottle(o6)
-        d1 = self.d1(bottle)
-        d2 = self.d2(torch.cat([o6, d1], 1))
-        d3 = self.d3(torch.cat([o5, d2], 1))
-        d4 = self.d4(torch.cat([o4, d3], 1))
-        d5 = self.d5(torch.cat([o3, d4], 1))
-        d6 = self.d6(torch.cat([o2, d5], 1))
-
-        if self.normal:
-            d5_l = self.d5_l(torch.cat([o3, d4], 1))
-            d6_l = self.d6_l(torch.cat([o2, d5_l], 1))
-
-            out = self.out(torch.cat([o1, d6], 1))
-            out_l = self.out_l(torch.cat([o1, d6_l], 1))
-
-            return torch.cat([out, out_l], 1)
-
-        out = self.out(d6)
-
-        return out
-
-
-class specular(nn.Module):
-    """Create a Unet-based generator"""
-
-    def __init__(self, input_nc, output_nc, ngf=8, sh_num=25):
-        """Construct a Unet generator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            output_nc (int) -- the number of channels in output images
-            num_downs (int) -- the number of downsamplings in UNet. For example, # if |num_downs| == 7,      下采样的次数（每次对半）
-                                image of size 128x128 will become of size 1x1 # at the bottleneck
-            ngf (int)       -- the number of filters in the last conv layer
-            norm_layer      -- normalization layer
-        """
-        super(specular, self).__init__()
-
-        self.e1 = nn.Sequential(*[
-            nn.Conv2d(input_nc, 8, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-        ])
-        self.e2 = nn.Sequential(*[
-            nn.Conv2d(8, 16, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(16, stride=2)
-        ])
-        self.e3 = nn.Sequential(*[
-            nn.Conv2d(16, 32, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(32, stride=2)
-        ])
-        self.e4 = nn.Sequential(*[
-            nn.Conv2d(32, 64, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(64, stride=2)
-        ])
-        self.e5 = nn.Sequential(*[
-            nn.Conv2d(64, 128, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(128, stride=2)
-        ])
-        self.e6 = nn.Sequential(*[
-            nn.Conv2d(128, 256, 3, 1, 1, bias=True),
-            # nn.MaxPool2d(2, 2),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(256, stride=2)
-        ])
-        self.bottle = nn.Sequential(*[
-            nn.Conv2d(256, 256, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True),
-            BlurPool(256, stride=2)
-        ])
-        self.fusion = nn.Sequential(*[
-            nn.Conv2d(512, 256, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True),
-        ])
-        self.d1 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(256, 256, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d2 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(512, 128, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d3 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(256, 64, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d4 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(128, 32, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d5 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(64, 16, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.d6 = nn.Sequential(*[
-            nn.Upsample(scale_factor=2, mode='bilinear'),
-            nn.Conv2d(32, 8, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
-        self.out = nn.Sequential(*[
-            nn.Conv2d(16, 16, 3, 1, 1, bias=True),
-            nn.LeakyReLU(0.2, True)
-        ])
+        self.model = TFA_Attention(in_nc) if is_att else DeformConv(in_nc)
         
+    def forward(self, nbr):
+        """_summary_
 
-        self.out1 = nn.Sequential(*[
-            nn.Conv2d(16, 8, 3, 1, 1, bias=True),
-            nn.Conv2d(8, output_nc, 1, 1),
-            # nn.Softmax()
-            # nn.ReLU(True)
-            # nn.Sigmoid()
-        ])
+        Args:
+            nbr (tensor): Input temporal features. The middle one is the reference frame. Shape: [B, F, C, H, W]
 
-        self.fc_light = nn.Linear(25*3, 256)
-        self.up_light = nn.Upsample(scale_factor=8)
-
-    def forward(self, x, light):
-        light = torch.flatten(light, 1).unsqueeze(-1).unsqueeze(-1)
-        light = self.up_light(self.fc_light(light))
-        o1 = self.e1(x)
-        o2 = self.e2(o1)
-        o3 = self.e3(o2)
-        o4 = self.e4(o3)
-        o5 = self.e5(o4)
-        o6 = self.e6(o5)
-        bottle = self.bottle(o6)
-        bottle = self.fusion(torch.cat([bottle, light], 1))
-        d1 = self.d1(bottle)
-        d2 = self.d2(torch.cat([o6, d1], 1))
-        d3 = self.d3(torch.cat([o5, d2], 1))
-        d4 = self.d4(torch.cat([o4, d3], 1))
-        d5 = self.d5(torch.cat([o3, d4], 1))
-        d6 = self.d6(torch.cat([o2, d5], 1))
-        out = self.out(torch.cat([o1, d6], 1))
-
-        out = self.out1(out)
-
-        return out
-
-
-class ResnetGenerator(nn.Module):
-    """Resnet-based generator that consists of Resnet blocks between a few downsampling/upsampling operations.
-
-    We adapt Torch code and idea from Justin Johnson's neural style transfer project(https://github.com/jcjohnson/fast-neural-style)
-    """
-
-    def __init__(self, input_nc, output_nc, ngf=32, norm='Batch', use_dropout=False, n_blocks=9,
-                 padding_type='reflect'):
-        """Construct a Resnet-based generator
-
-        Parameters:
-            input_nc (int)      -- the number of channels in input images
-            output_nc (int)     -- the number of channels in output images
-            ngf (int)           -- the number of filters in the last conv layer
-            norm_layer          -- normalization layer
-            use_dropout (bool)  -- if use dropout layers
-            n_blocks (int)      -- the number of ResNet blocks
-            padding_type (str)  -- the name of padding layer in conv layers: reflect | replicate | zero
-        """
-        assert (n_blocks >= 0) # 若条件满足则继续往下运行，否则显示AssertError，停止往下运行。
-        super(ResnetGenerator, self).__init__()
-        use_bias = True
-        norm_layer = nn.BatchNorm2d
-        model = [nn.ReflectionPad2d(3),   # 上下左右均填充三行像素，最终就是行填充了6行，列填充了6列
-                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
-                 norm_layer(ngf),
-                 nn.ReLU(True)]
-
-        n_downsampling = 2
-        for i in range(n_downsampling):  # add downsampling layers
-            mult = 2 ** i
-            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                      norm_layer(ngf * mult * 2),
-                      nn.ReLU(True)]
-
-        mult = 2 ** n_downsampling
-        for i in range(n_blocks):  # add ResNet blocks
-
-            model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout,
-                                  use_bias=use_bias)]
-
-        for i in range(n_downsampling):  # add upsampling layers
-            mult = 2 ** (n_downsampling - i)
-            model += [nn.Upsample(scale_factor=2),
-                      nn.Conv2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=1, padding=1, bias=use_bias),
-                      norm_layer(int(ngf * mult / 2)),
-                      nn.ReLU(True)]
-        model += [nn.ReflectionPad2d(1)]
-        model += [nn.Conv2d(ngf, output_nc, kernel_size=3, padding=0)]
-        # model += [nn.ReLU(True)]
-        model += [nn.LeakyReLU(0.7)]
-
-        self.model = nn.Sequential(*model) # 将字典类的model转换为真正的可以运行的model
-
-    def forward(self, x): 
-        return self.model(x)
+        Returns:
+            tensor: Aligned features. The shape is the same as the input.
+        """        
+        b, f, c, h, w = nbr.shape
+        ref = nbr[:, f//2:f//2 + 1].expand_as(nbr)
+        nbr = self.model(nbr, ref)
+        return nbr
 
 class ResnetBlock(nn.Module):
     """Define a Resnet block"""
@@ -712,135 +426,6 @@ class ResnetBlock(nn.Module):
         out = x + self.conv_block(x)  # add skip connections
         return out
 
-
-class NLayerDiscriminator(nn.Module):
-    """Defines a PatchGAN discriminator"""
-
-    def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d):
-        """Construct a PatchGAN discriminator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            ndf (int)       -- the number of filters in the last conv layer
-            n_layers (int)  -- the number of conv layers in the discriminator
-            norm_layer      -- normalization layer
-        """
-        super(NLayerDiscriminator, self).__init__()
-        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
-
-        kw = 4
-        padw = 1
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
-        nf_mult = 1
-        nf_mult_prev = 1
-        for n in range(1, n_layers):  # gradually increase the number of filters
-            nf_mult_prev = nf_mult
-            nf_mult = min(2 ** n, 8)
-            sequence += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True)
-            ]
-
-        nf_mult_prev = nf_mult
-        nf_mult = min(2 ** n_layers, 8)
-        sequence += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-            norm_layer(ndf * nf_mult),
-            nn.LeakyReLU(0.2, True)
-        ]
-
-        sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
-        self.model = nn.Sequential(*sequence)
-
-    def forward(self, input):
-        """Standard forward."""
-        return self.model(input)
-
-class Discriminator(nn.Module):
-    """Defines a PatchGAN discriminator"""
-
-    def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d):
-        """Construct a VGG discriminator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            ndf (int)       -- the number of filters in the last conv layer
-            n_layers (int)  -- the number of conv layers in the discriminator
-            norm_layer      -- normalization layer
-        """
-        super(Discriminator, self).__init__()
-        use_bias = True
-
-        kw = 4
-        padw = 1
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
-        nf_mult = 1
-        nf_mult_prev = 1
-        for n in range(1, n_layers):  # gradually increase the number of filters
-            nf_mult_prev = nf_mult
-            nf_mult = min(2 ** n, 8)
-            sequence += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True)
-            ]
-
-        nf_mult_prev = nf_mult
-        nf_mult = min(2 ** n_layers, 8)
-        sequence += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-            norm_layer(ndf * nf_mult),
-            nn.LeakyReLU(0.2, True)
-        ]
-
-        self.linear = nn.Linear(ndf * nf_mult * 32 * 32, 1, bias=True)  # output 1 channel prediction map
-        self.sigmoid = nn.Sigmoid()
-        self.model = nn.Sequential(*sequence)
-
-    def forward(self, input):
-        """Standard forward."""
-        out = self.model(input).reshape(input.shape[0], -1)
-        logits = self.linear(out)
-        sigmoid = self.sigmoid(logits)
-        return logits, sigmoid
-
-
-class GANLoss(nn.Module):  # 继承nn.Module时，需要用到super函数；数据集继承ABC时不用。
-    def __init__(self, mask, gan_type='vanilla', real_label_val=1.0, fake_label_val=0.0):
-        super(GANLoss, self).__init__()
-        self.mask = mask
-        self.gan_type = gan_type.lower() # 全部转为小写
-        self.real_label_val = real_label_val
-        self.fake_label_val = fake_label_val
-
-        if self.gan_type == 'vanilla':
-            self.loss = nn.BCEWithLogitsLoss()
-        elif self.gan_type == 'lsgan':
-            self.loss = nn.MSELoss()
-        elif self.gan_type == 'wgan-gp':
-
-            def wgan_loss(input, target):
-                # target is boolean
-                return -1 * input.mean() if target else input.mean()
-
-            self.loss = wgan_loss
-        else:
-            raise NotImplementedError('GAN type [{:s}] is not found'.format(self.gan_type))
-
-    def get_target_label(self, input, target_is_real):
-        if self.gan_type == 'wgan-gp':
-            return target_is_real
-        if target_is_real:
-            return torch.empty_like(input).fill_(self.real_label_val) # 返回与输入同样大小的tensor，其中所有值都置为self.real_label_val
-        else:
-            return torch.empty_like(input).fill_(self.fake_label_val)
-
-    def forward(self, input, target_is_real):
-        target_label = self.get_target_label(input, target_is_real)
-        loss = self.loss(input, target_label)
-        return loss
 
 def get_LoG_kernel(size, sigma, device):
     lin = torch.linspace(-(size - 1) // 2, size // 2, size, device=device)
@@ -920,9 +505,3 @@ def init_net(net, init_type='normal', init_gain=0.02):
 def define_G(sh_num, is_res=False, init_type='normal', init_gain=0.02, Net="Unet"):
     net = VideoRelight(sh_num=sh_num) if not is_res else ShadingRes()
     return init_net(net, init_type, init_gain)
-
-
-def define_D(input_nc, ngf, local_rank, init_type='normal', init_gain=0.02):
-    net = None
-    net = NLayerDiscriminator(input_nc, ngf)
-    return init_net(net, local_rank, init_type, init_gain)
