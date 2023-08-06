@@ -335,8 +335,9 @@ class DeformConv(nn.Module):
         Returns:
             tensor: aligned features.
         """        
-        b, f, _ = nbr.shape
-        off = self.lrelu(self.off_conv1(torch.cat([nbr.flatten(0, 1), ref.flatten(0, 1)], dim=1)))
+        b, f, *_ = nbr.shape
+        nbr = nbr.flatten(0, 1)
+        off = self.lrelu(self.off_conv1(torch.cat([nbr, ref.flatten(0, 1)], dim=1)))
         off = self.lrelu(self.off_conv2(off))
         fea = self.dcnpack([nbr, off]).unflatten(0, (b, f)) # Shape: [B, F, C, H, W]
         return fea
@@ -505,3 +506,8 @@ def init_net(net, init_type='normal', init_gain=0.02):
 def define_G(sh_num, is_res=False, init_type='normal', init_gain=0.02, Net="Unet"):
     net = VideoRelight(sh_num=sh_num) if not is_res else ShadingRes()
     return init_net(net, init_type, init_gain)
+
+# if __name__ == "__main__":
+#     a = torch.randn([4, 5, 32, 32, 32]).cuda()
+#     block = TFA_Block(32, True).cuda()
+#     print(block(a).shape)
