@@ -5,6 +5,7 @@ from utils import ssim, psnr
 import torchvision
 import numpy as np
 from PIL import Image
+from torch.cuda.amp import GradScaler
 
 
 class BaseModel(torch.nn.Module):
@@ -43,6 +44,8 @@ class BaseModel(torch.nn.Module):
         self.optimizer_name = []
         self.ssim = []
         self.psnr = []
+        if opt.amp:
+            self.scaler = GradScaler()
 
     @abstractmethod
     def set_input(self, input):

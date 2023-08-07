@@ -4,7 +4,7 @@ import numpy as np
 import models.networks as networks
 import torch.nn.functional as F
 from .BaseModel import BaseModel
-import os
+from torch.cuda.amp import autocast
 DEBUG = False
 eps = 1e-8
 l2png = lambda x: torch.pow(x.clamp_min_(0), 1/2.2).clip(0, 1)
@@ -161,19 +161,28 @@ class lumos(BaseModel):
         if self.opt.video:
             self.loss_matching = self.get_matching_loss()
             self.loss_total += self.loss_matching
-        self.loss_total.backward()
 
     def optimize_parameters(self, epoch):
         self.epoch = epoch
-        self.forward()
-        """Calculate losses, gradients, and update network weights; called in every training iteration"""
         self.optim_main.zero_grad()  # set G_A and G_B's gradients to zero
         if self.opt.use_res and self.epoch >= self.opt.res_epoch:
             self.optim_residual.zero_grad()
-        self.backward_G()             # calculate gradients for G_A and G_B
-        self.optim_main.step()       # update G_A and G_B's weights
-        if self.opt.use_res and self.epoch >= self.opt.res_epoch:
-            self.optim_residual.step()
+        if self.opt.amp:
+            with autocast():
+                self.forward()
+                self.backward_G()
+            self.scaler.scale(self.loss_total).backward()
+            self.scaler.step(self.optim_main)
+            if self.opt.use_res and self.epoch >= self.opt.res_epoch:
+                self.scaler.step(self.optim_residual)
+            self.scaler.update()
+        else:
+            self.forward()
+            self.backward_G()
+            self.loss_total.backward()
+            self.optim_main.step()
+            if self.opt.use_res and self.epoch >= self.opt.res_epoch:
+                self.optim_residual.step()
     
     def concat_img(self, id):
         if self.opt.use_res and self.epoch >= self.opt.res_epoch:

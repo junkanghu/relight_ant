@@ -39,6 +39,7 @@ def get_opt():
                         help='Learning rate for training')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='batch size for training')
+    parser.add_argument('--amp', action="store_true", help="whether use torch amp")
 
     # Model-dependent options
     parser.add_argument('--tfa_att', action="store_true", help='Feature alignment algorithms. Default is deform conv.')
