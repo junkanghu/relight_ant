@@ -22,17 +22,18 @@ class lumos(BaseModel):
         super(lumos, self).__init__(opt)
         self.loss_l1 = nn.L1Loss().to(self.device)
         self.sf_loss = networks.SpatialFrequencyLoss(device=self.device)
+        self.einsum_format = 'bchw,bcd->bdhw' if not opt.video else 'bfchw,bfcd->bfdhw'
 
         self.optimizer_name = ['optim_main']
         self.net_name = ['main']
         
-        self.net_main = networks.define_G(opt.sh_num)
+        self.net_main = networks.define_G(opt.sh_num, is_video=opt.video)
         self.optim_main = torch.optim.Adam(self.net_main.parameters(),lr=opt.lr, betas=(0.5, 0.999))
 
         if opt.use_res:
             self.optimizer_name.append('optim_residual')
             self.net_name.append('residual')
-            self.net_residual = networks.define_G(opt.sh_num, is_res=True)
+            self.net_residual = networks.define_G(opt.sh_num, is_res=True, is_video=opt.video)
             self.optim_residual = torch.optim.Adam(self.net_residual.parameters(),lr=opt.lr, betas=(0.5, 0.999))
 
         self.loss_name = self.get_loss_name()
@@ -54,22 +55,39 @@ class lumos(BaseModel):
             self.bshading = data['bshading'].to(self.device) * self.mask
             self.bprt_d = data['bprt_d'].to(self.device) * self.mask
 
+    def get_matching_loss(self):
+        loss = 0.
+        for res in self.res_groups:
+            if res is not None:
+                loss += self.loss_l1(res.flatten(0, 1), torch.empty_like(res).fill_(0.).flatten(0, 1))
+        return loss
+    
+    def get_res_loss(self):
+        loss = 0.
+        L_shading_final = self.loss_l1(self.shading_final, self.bshading)
+        L_shading_sf = self.sf_loss(self.shading_final, self.bshading)
+        L_rendering_diff = self.loss_l1(self.diffuse_final, self.bprt_d)
+        loss = L_shading_final + L_shading_sf + L_rendering_diff
+        return loss
+
     def forward(self):
-        transport_d_hat, transport_s_hat, albedo_hat, light_hat = self.net_main(self.input)
+        transport_d_hat, transport_s_hat, albedo_hat, light_hat, *res_groups = self.net_main(self.input)
         self.albedo_hat = self.mask * albedo_hat
         self.transport_d_hat = self.mask * transport_d_hat
         self.transport_s_hat = self.mask * transport_s_hat
         self.light_hat = light_hat
+        if self.opt.video:
+            self.res_groups = res_groups[0]
         
-        self.shading_all_hat_linear = torch.einsum('bchw,bcd->bdhw', self.transport_d_hat, self.light_hat)
+        self.shading_all_hat_linear = torch.einsum(self.einsum_format, self.transport_d_hat, self.light_hat)
         self.shading_all_hat = l2srgb(self.shading_all_hat_linear) * self.mask
-        self.sepc_all_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light_hat)) * self.mask
+        self.sepc_all_hat = l2srgb(torch.einsum(self.einsum_format, self.transport_s_hat, self.light_hat)) * self.mask
         self.diffuse = self.albedo_hat * self.shading_all_hat
         self.rendering = self.diffuse + self.albedo_hat * self.sepc_all_hat
         
         if self.opt.use_res and self.epoch >= self.opt.res_epoch:
             self.shading_res = self.net_residual(torch.cat([self.shading_all_hat.detach(), 
-                                self.transport_d_hat.detach()], 1), self.light_hat.detach()) * self.mask
+                                self.transport_d_hat.detach()], -3), self.light_hat.detach()) * self.mask
             self.shading_final = l2srgb(self.shading_all_hat_linear + self.shading_res) * self.mask
             self.diffuse_final = self.shading_final * self.albedo_hat
             self.rendering_final = self.diffuse_final + self.albedo_hat * self.sepc_all_hat
@@ -81,17 +99,17 @@ class lumos(BaseModel):
         L_albedo_sf = self.sf_loss(self.albedo_hat, self.albedo)
         L_light = self.loss_l1(self.light_hat, self.light)
 
-        shading_transport_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_d_hat, self.light)) * self.mask
+        shading_transport_hat = l2srgb(torch.einsum(self.einsum_format, self.transport_d_hat, self.light)) * self.mask
         L_shading_transport = self.loss_l1(shading_transport_hat, self.shading)
 
-        spec_transport_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s_hat, self.light)) * self.mask
+        spec_transport_hat = l2srgb(torch.einsum(self.einsum_format, self.transport_s_hat, self.light)) * self.mask
         L_spec_transport = self.loss_l1(spec_transport_hat * self.albedo, self.prt_s)
         L_spec_transport1 = self.loss_l1(spec_transport_hat * self.albedo_hat, self.prt_s)
 
-        shading_light_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_d, self.light_hat)) * self.mask
+        shading_light_hat = l2srgb(torch.einsum(self.einsum_format, self.transport_d, self.light_hat)) * self.mask
         L_shading_light = self.loss_l1(shading_light_hat, self.shading)
 
-        spec_light_hat = l2srgb(torch.einsum('bchw,bcd->bdhw', self.transport_s, self.light_hat)) * self.mask
+        spec_light_hat = l2srgb(torch.einsum(self.einsum_format, self.transport_s, self.light_hat)) * self.mask
         L_spec_light = self.loss_l1(spec_light_hat * self.albedo, self.prt_s)
         L_spec_light1 = self.loss_l1(spec_light_hat * self.albedo_hat, self.prt_s)
 
@@ -138,12 +156,11 @@ class lumos(BaseModel):
             self.opt.w_rendering_all * (L_rendering_all1 + L_rendering_all2 + L_rendering_all3) * 0.5
             
         if self.opt.use_res and self.epoch >= self.opt.res_epoch:
-            L_shading_final = self.loss_l1(self.shading_final, self.bshading)
-            L_shading_sf = self.sf_loss(self.shading_final, self.bshading)
-            L_rendering_diff = self.loss_l1(self.diffuse_final, self.bprt_d)
-            
-            self.loss_res = L_shading_final + L_shading_sf + L_rendering_diff
+            self.loss_res = self.get_res_loss()
             self.loss_total += self.loss_res
+        if self.opt.video:
+            self.loss_matching = self.get_matching_loss()
+            self.loss_total += self.loss_matching
         self.loss_total.backward()
 
     def optimize_parameters(self, epoch):
@@ -197,4 +214,6 @@ class lumos(BaseModel):
         name = ['total']
         if self.opt.use_res:
             name.append('res')
+        if self.opt.video:
+            name.append('matching')
         return name

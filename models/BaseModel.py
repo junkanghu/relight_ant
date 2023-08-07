@@ -203,6 +203,8 @@ class BaseModel(torch.nn.Module):
         for name in self.optimizer_name:
             if isinstance(name, str) and name in list(ckpt.keys()):
                 optimizer = getattr(self, name)
+                if not len(ckpt[name]['param_groups'][0]['params']) == len(optimizer.state_dict()['param_groups'][0]['params']):
+                    continue
                 optimizer.load_state_dict(ckpt[name])
         return start_epoch
 

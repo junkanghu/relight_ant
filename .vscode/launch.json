@@ -11,14 +11,15 @@
             "program": "${file}",
             "args": [
                 "--config", "./configs/train.yml",
-                "--batch_size", "8",
+                "--batch_size", "1",
                 "--out_dir", "debug",
                 "--use_res",
-                "--res_epoch", "1"
+                "--res_epoch", "1",
+                "--video"
             ],
             "env": {
                 "OMP_NUM_THREADS": "32",
-                "CUDA_VISIBLE_DEVICES": "3",
+                "CUDA_VISIBLE_DEVICES": "7",
                 "workspace": "./"
             },
             "console": "integratedTerminal",
