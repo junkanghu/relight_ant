@@ -84,6 +84,10 @@ class Attend(nn.Module):
 
         return out
 
+    # def chunk(self, q, k, b, f):
+    #     sim = torch.einsum(f"b f c d, b f c e -> b f d e", q, k)
+    #     return weight
+
     def forward(self, q, k, v, bias = None):
         """
         einstein notation

@@ -39,7 +39,7 @@ class lumos(BaseModel):
         self.loss_name = self.get_loss_name()
         self.initialize_loss()
 
-    def set_input(self, data):
+    def set_input_image(self, data):
         self.mask = data['mask'].to(self.device)
         self.albedo = data['albedo'].to(self.device) * self.mask
         self.shading = data['shading'].to(self.device) * self.mask
@@ -54,6 +54,18 @@ class lumos(BaseModel):
         if self.opt.use_res:
             self.bshading = data['bshading'].to(self.device) * self.mask
             self.bprt_d = data['bprt_d'].to(self.device) * self.mask
+            
+    def set_input_video(self, data):
+        self.mask = data['mask'].to(self.device)
+        self.light = data['light'].to(self.device)
+        self.input = data['input'].to(self.device) * self.mask
+        self.name = data['name']
+
+    def set_input(self, data):
+        if self.opt.video:
+            self.set_input_video(data)
+        else:
+            self.set_input_image(data)
 
     def get_matching_loss(self):
         loss = 0.
