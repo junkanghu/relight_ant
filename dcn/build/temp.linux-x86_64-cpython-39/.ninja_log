@@ -1,0 +1,3 @@
+# ninja log v5
+1	17896	1691218928781695080	/home/hujunkang/codes/DVM/dcn/build/temp.linux-x86_64-cpython-39/src/deform_conv_cuda.o	b19db57fc83f4f55
+1	18388	1691218929277696785	/home/hujunkang/codes/DVM/dcn/build/temp.linux-x86_64-cpython-39/src/deform_conv_cuda_kernel.o	a2a980b3ad9d056c
