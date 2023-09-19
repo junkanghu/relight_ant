@@ -1,15 +1,19 @@
 from option import get_opt
-from models.TrainModel import lumos
-
+from models.TestModel import lumos
+from data.TestDataset import create_dataset
+# from data.TestDataset_albedos import create_dataset
 
 if __name__ == "__main__":
     opt = get_opt()
     opt.test = True
-    model = lumos(opt)
+    model = lumos(opt).cuda()
     model.load_ckpt()
-    dataset_test = Dataset(opt, stage='test')
-    dataloader_test = create_dataset(opt, dataset_test, shuffle=False, val=True)
+    dataloader_test = create_dataset(opt)
     for i, data in enumerate(dataloader_test):
         model.set_input(data)
+        # model.eval()
+        # model.forward()
         model.test()
-    model.print_metric()
+        # model.save_albedos()
+        # model.save_inferred()
+    # model.print_metric()

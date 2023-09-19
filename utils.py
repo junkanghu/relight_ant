@@ -6,6 +6,7 @@ from torch.autograd import Variable
 from math import exp
 import logging
 from torch.utils.tensorboard import SummaryWriter
+import datetime
 
 def workspace_config(opt):
     workspace = os.getenv('workspace')
@@ -45,7 +46,7 @@ def init_distributed_mode(args):
     print('distributed init rank {}: {}'.format(args.rank, args.dist_url), flush=True)
     '''
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                        world_size=args.world_size, rank=args.rank)
+                                        world_size=args.world_size, rank=args.rank, timeout=datetime.timedelta(seconds=18000))
     torch.distributed.barrier()
 
     if args.distributed:
@@ -58,7 +59,8 @@ def init(opt):
     logging.basicConfig(filename=opt.log_dir, filemode='a', format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.INFO)
     if opt.rank == 0:
         writer = SummaryWriter(opt.out_dir)
-    return writer
+        return writer
+    return None
 
 @torch.no_grad()
 def gaussian(window_size, sigma):
@@ -109,11 +111,11 @@ def ssim(img1, img2, window_size = 11, size_average = True):
 @torch.no_grad()
 def psnr(img1, img2):
     """
-    img shape: [C, H, W]
+    img shape: [B, C, H, W]
     """
     img1 = img1.cpu()
     img2 = img2.cpu()
-    c, h, w = img1.shape
-    mse = torch.sum(torch.pow(img1 - img2, 2)) / (c * h * w)
+    b, c, h, w = img1.shape
+    mse = torch.sum(torch.pow(img1 - img2, 2)) / (b * c * h * w)
     mse2psnr = lambda x: -10. * torch.log(x + 1e-8) / torch.log(torch.FloatTensor([10.]))
     return mse2psnr(mse).item()

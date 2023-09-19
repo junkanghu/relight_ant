@@ -10,7 +10,6 @@ import logging
 import os
 
 if __name__ == "__main__":
-    # torch.backends.cudnn.benchmark = True
     opt = get_opt()
     writer = init(opt)
     dataloader_train, dataloader_val = create_dataset(opt)
@@ -42,11 +41,26 @@ if __name__ == "__main__":
                 get_model(model).save_ckpt(epoch)
 
         if epoch % opt.val_fre == 0:
+            get_model(model).eval()
             for i, data in enumerate(dataloader_val):
-                get_model(model).set_input(data)
+                get_model(model).set_input(data, val=True)
                 get_model(model).val(epoch)
-            
+
+            if opt.distributed:
+                torch.distributed.barrier() # Synchronize the processes to ensure all images are obtained before ffmpeg runs.
             if opt.rank == 0:
-                ssim, psnr = get_model(model).print_metric()
-                writer.add_scalar('ssim', ssim, epoch)
-                writer.add_scalar('psnr', psnr, epoch)
+                if opt.video:
+                    if opt.use_video_writer:
+                        get_model(model).video_writer_albedo.close()
+                        get_model(model).video_writer_rendering.close()
+                    else:
+                        get_model(model).video_writer.composite(epoch)
+                else:
+                    if opt.cal_metric:
+                        ssim, psnr, ssim_albedo, psnr_albedo = get_model(model).print_metric()
+                        writer.add_scalar('ssim', ssim, epoch)
+                        writer.add_scalar('psnr', psnr, epoch)
+                        writer.add_scalar('ssim_albedo', ssim_albedo, epoch)
+                        writer.add_scalar('psnr_albedo', psnr_albedo, epoch)
+                        logging.info(f'ssim: {ssim} psnr: {psnr} ssim-albedo: {ssim_albedo} psnr-albedo: {psnr_albedo}')
+            get_model(model).train()

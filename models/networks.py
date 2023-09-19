@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import functools
-from .attend import Attend, TFA_Attention
+# from .attend import Attend, TFA_Attention
 import numpy as np
 from torch.nn import init
 from torch.optim import lr_scheduler
@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from antialiased_cnns.blurpool import BlurPool
 import math
-from .deform_conv import ModulatedDeformConvPack as DCN
+# from .deform_conv import ModulatedDeformConvPack as DCN
 from einops import rearrange
 ac_type = {
     "relu": nn.ReLU,
@@ -27,10 +27,10 @@ class VideoRelight(nn.Module):
     def __init__(self, encoder_dims=[3, 64, 128, 256, 512, 512],
                 decoder_dims=[512, 512, 256, 128, 64, 32],
                 skip_dims=[512, 256, 128, 64, 0],
-                light_dims=[512*3, 512, 256, 128], sh_num=25, is_video=False):
+                light_dims=[512*3, 512, 256, 128], sh_num=25, is_video=False, use_tfa=False):
         super().__init__()
         self.encoder = Encoder(encoder_dims)
-        self.decoder = Decoder(decoder_dims, skip_dims, light_dims, sh_num, is_video=is_video)
+        self.decoder = Decoder(decoder_dims, skip_dims, light_dims, sh_num, is_video=is_video, use_tfa=use_tfa)
         
     def forward(self, x):
         x = self.encoder(x)
@@ -107,7 +107,8 @@ class Encoder(nn.Module):
 class UpsamplingBlock(nn.Module):
     def __init__(self, in_nc, skin_nc, out_nc,
                 kernel_size, stride, padding, bias=False,
-                norm=None, ac=None, dropout=False, drop_p=0.5, lr_slope=0.01, is_video=False, is_albedo=False, is_last=False):
+                norm=None, ac=None, dropout=False, drop_p=0.5, lr_slope=0.01,
+                is_video=False, is_albedo=False, is_last=False, use_tfa=False):
         """Upsampling block for decoder.
 
         Args:
@@ -144,10 +145,11 @@ class UpsamplingBlock(nn.Module):
         self.model = nn.Sequential(*model)
         self.is_albedo = is_albedo
         self.temporal = None
-        if is_video and not is_last:
-            self.temporal = TemporalBlock(out_nc)
-            if is_albedo:
-                self.tfa = TFA_Block(out_nc)
+        self.use_tfa = use_tfa
+        # if is_video and not is_last:
+        #     self.temporal = TemporalBlock(out_nc)
+        #     if is_albedo and use_tfa:
+        #         self.tfa = TFA_Block(out_nc)
     
     def forward_single_frame(self, x1, x2=None):
         """
@@ -172,7 +174,7 @@ class UpsamplingBlock(nn.Module):
         res = None
         if self.temporal is not None:
             x1 = self.temporal(x1)
-            if self.is_albedo:
+            if self.is_albedo and self.use_tfa:
                 res = self.tfa(x1)
         return x1, res
     
@@ -183,7 +185,7 @@ class UpsamplingBlock(nn.Module):
             return self.forward_single_frame(x1, x2)
 
 class Decoder_Albedo(nn.Module):
-    def __init__(self, decoder_dims, skip_dims, is_video=False):
+    def __init__(self, decoder_dims, skip_dims, is_video=False, use_tfa=False):
         """Branch for albedo.
 
         Args:
@@ -196,8 +198,9 @@ class Decoder_Albedo(nn.Module):
         for i in range(self.n_layer):
             setattr(self, "up{}".format(i),
                 UpsamplingBlock(decoder_dims[i], skip_dims[i], decoder_dims[i+1], 3, 1, 1,
-                norm="batch", ac="relu", dropout=True if i < 2 else False, is_video=is_video, is_albedo=True, is_last=(i == self.n_layer - 1)))
-        self.out = nn.Sequential(nn.Conv2d(decoder_dims[-1], 3, kernel_size=3, stride=1, padding=1, bias=False),
+                norm="batch", ac="relu", dropout=True if i < 2 else False, is_video=is_video,
+                is_albedo=True, is_last=(i == self.n_layer - 1), use_tfa=use_tfa))
+        self.out = nn.Sequential(nn.Conv2d(decoder_dims[-1], 4, kernel_size=3, stride=1, padding=1, bias=False),
                                 nn.Sigmoid())
         
     def block(self, x, bottle):
@@ -339,9 +342,9 @@ class Decoder_Light(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, decoder_dims=[512, 512, 256, 128, 64, 32],
                 skip_dims=[512, 256, 128, 64, 0],
-                light_dims=[512*3, 512, 256, 128], sh_num=25, is_video=False):
+                light_dims=[512*3, 512, 256, 128], sh_num=25, is_video=False, use_tfa=False):
         super().__init__()
-        self.decoder_albedo = Decoder_Albedo(decoder_dims, skip_dims, is_video=is_video)
+        self.decoder_albedo = Decoder_Albedo(decoder_dims, skip_dims, is_video=is_video, use_tfa=use_tfa)
         self.decoder_transport = Decoder_Transport(decoder_dims, skip_dims, sh_num, is_video=is_video)
         self.decoder_light = Decoder_Light(light_dims, sh_num, is_video=is_video)
         
@@ -368,9 +371,8 @@ class Decoder_Res(nn.Module):
             setattr(self, "up{}".format(i),
                 UpsamplingBlock(decoder_dims[i], skip_dims[i], decoder_dims[i+1], 3, 1, 1,
                     norm="batch", ac="relu", dropout=True if i < 2 else False, lr_slope=lr_slope, is_video=is_video))
-        self.fc_light = nn.Linear(25*3, decoder_dims[0])
-        self.up_light = nn.Upsample(scale_factor=16)
-        self.fusion = ConvBlock(decoder_dims[0]*2, decoder_dims[0], 3, 1, 1, ac="leakyrelu", lr_slope=0.2)
+        self.fc_light = nn.Linear(25*3, decoder_dims[0] * 16 * 16 // 4)
+        self.fusion = ConvBlock(decoder_dims[0]//4*5, decoder_dims[0], 3, 1, 1, ac="leakyrelu", lr_slope=0.2)
         self.out = nn.Sequential(ConvBlock(decoder_dims[-1], 8, 3, 1, 1),
                                 ConvBlock(8, 3, 3, 1, 1))
         
@@ -391,8 +393,9 @@ class Decoder_Res(nn.Module):
             Shading residual which is to be added to the original shading.
         """        
         inter = self.bottlneck(x[-1])
+        b, c, h, w = inter.shape
         light = torch.flatten(light, 1)
-        light = self.up_light(self.fc_light(light).unsqueeze(-1).unsqueeze(-1))
+        light = self.fc_light(light).reshape(b, c//4, h, w)
         inter = self.fusion(torch.cat([inter, light], 1))
         inter = self.block(x, inter)
         inter = self.out(inter)
@@ -400,8 +403,9 @@ class Decoder_Res(nn.Module):
 
     def forward_time_series(self, x, light):
         inter = self.bottlneck(x[-1].flatten(0, 1))
+        _, c, h, w = inter.shape
         light = rearrange(light, 'b f c d -> (b f) (c d)')
-        light = self.up_light(self.fc_light(light).unsqueeze(-1).unsqueeze(-1))
+        light = self.fc_light(light).reshape(-1, c//4, h, w)
         inter = self.fusion(torch.cat([inter, light], 1)).unflatten(0, x[0].shape[:2])
         inter = self.block(x, inter)
         inter = self.out(inter.flatten(0, 1)).unflatten(0, x[0].shape[:2])
@@ -669,29 +673,40 @@ def init_weights(net, init_type='normal', init_gain=0.02):
 
     print('initialize network with %s' % init_type)
     net.apply(init_func)  # apply the initialization function <init_func>
-
+    
+def freeze_module(net):
+    for param in net.parameters():
+        param.requires_grad = False
+    def init_func(m):  # define the initialization function
+        classname = m._get_name()
+        if classname.find('TemporalBlock') != -1:
+            for param in m.parameters():
+                param.requires_grad = True
+    net.apply(init_func)
 
 def init_net(net, init_type='normal', init_gain=0.02):
     init_weights(net, init_type, init_gain=init_gain)
+    # freeze_module(net)
     return net
 
-def define_G(sh_num, is_res=False, is_video=False, init_type='normal', init_gain=0.02, Net="Unet"):
-    net = VideoRelight(sh_num=sh_num, is_video=is_video) if not is_res else ShadingRes(is_video=is_video)
+def define_G(sh_num, is_res=False, is_video=False, use_tfa=False, init_type='normal', init_gain=0.02, Net="Unet"):
+    net = VideoRelight(sh_num=sh_num, is_video=is_video, use_tfa=use_tfa) if not is_res else ShadingRes(is_video=is_video)
     return init_net(net, init_type, init_gain)
 
 if __name__ == "__main__":
     # a = torch.randn([1, 3, 3, 512, 512]).cuda()
-    a = torch.randn([4, 3, 512, 512]).cuda()
-    model = VideoRelight(sh_num=25, is_video=False).cuda()
-    model_res = ShadingRes(is_video=False).cuda()
-    optim = torch.optim.Adam(model.parameters(),lr=0.0001, betas=(0.5, 0.999))
-    optim_res = torch.optim.Adam(model_res.parameters(),lr=0.0001, betas=(0.5, 0.999))
-    t_d, t_s, albedo, light, res_groups = model(a)
-    shading_all_hat_linear = torch.einsum('bchw,bcd->bdhw', t_d, light)
-    l2srgb = lambda x: torch.pow(x.clamp_min_(0.) + 1e-8, 1/2.2)
-    shading_all_hat = l2srgb(shading_all_hat_linear)
-    shading_res = model_res(torch.cat([shading_all_hat.detach(), 
-                                t_d.detach()], 1), light.detach())
+    # a = torch.randn([4, 3, 512, 512]).cuda()
+    model = VideoRelight(sh_num=25, is_video=True).cuda()
+    # model_res = ShadingRes(is_video=False).cuda()
+    # t_d, t_s, albedo, light, res_groups = model(a)
+    # shading_all_hat_linear = torch.einsum('bchw,bcd->bdhw', t_d, light)
+    # l2srgb = lambda x: torch.pow(x.clamp_min_(0.) + 1e-8, 1/2.2)
+    # shading_all_hat = l2srgb(shading_all_hat_linear)
+    # shading_all_hat = torch.randn([2, 3, 512, 512]).cuda()
+    # t_d = torch.randn([2, 25, 512, 512]).cuda()
+    # light = torch.randn([2, 25, 3]).cuda()
+    # shading_res = model_res(torch.cat([shading_all_hat, 
+                                # t_d], 1), light)
     # sepc_all_hat = l2srgb(torch.einsum('bfchw,bfcd->bfdhw', t_s, light))
     # diffuse = albedo * shading_all_hat
     # rendering = diffuse + albedo * sepc_all_hat
@@ -711,4 +726,27 @@ if __name__ == "__main__":
     # loss.backward()             # calculate gradients for G_A and G_B
     # optim_res.step()
     # optim.step()
+    
+    def print_module(net, init_type='normal', init_gain=0.02):
+        for param in net.parameters():
+            param.requires_grad = False
+        def init_func(m):  # define the initialization function
+            classname = m._get_name()
+            if classname.find('TemporalBlock') != -1:
+                print("classname:", classname)
+                for param in m.parameters():
+                    param.requires_grad = True
+            # if hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+            #     if init_type == 'normal':
+            #         init.normal_(m.weight.data, 0.0, init_gain)
+            #     if hasattr(m, 'bias') and m.bias is not None:
+            #         init.constant_(m.bias.data, 0.0)
+            # elif classname.find(
+            #         'BatchNorm2d') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
+            #     init.normal_(m.weight.data, 1.0, init_gain)
+            #     init.constant_(m.bias.data, 0.0)
+                
+        net.apply(init_func)
+    print_module(model)
+    print(1)
     print(1)

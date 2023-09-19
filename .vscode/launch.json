@@ -12,15 +12,18 @@
             "args": [
                 "--config", "./configs/train.yml",
                 "--batch_size", "1",
-                "--out_dir", "debug",
-                "--use_res",
-                "--res_epoch", "1",
-                "--video"
+                // "--amp",
+                // "--out_dir", "results",
+                // "--use_res",
+                // "--res_epoch", "1",
+                "--video",
+                // "--test_dir", "/nas/home/hujunkang/resized_real_data/images"
+                // "--test_dir", "/nas/home/hujunkang/wild_pose_dataset/_cRYAuM4pXI+003100+005700/images"
             ],
             "env": {
                 "OMP_NUM_THREADS": "32",
-                "CUDA_VISIBLE_DEVICES": "7",
-                "workspace": "./"
+                "CUDA_VISIBLE_DEVICES": "0",
+                "workspace": "/mnt/data4/home/hujunkang/test_model" //"/mnt/data4/home/hujunkang/relight-video"
             },
             "console": "integratedTerminal",
             "justMyCode": true
